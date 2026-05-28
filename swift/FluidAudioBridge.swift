@@ -34,7 +34,7 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                let models = try await AsrModels.downloadAndLoad()
+                let models = try await AsrModels.downloadAndLoad(version: .v2)
                 self.asrModels = models
 
                 let manager = AsrManager()
@@ -238,7 +238,7 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                let models = try await AsrModels.downloadAndLoad()
+                let models = try await AsrModels.downloadAndLoad(version: .v2)
                 self.asrModels = models
 
                 let manager = SlidingWindowAsrManager()
