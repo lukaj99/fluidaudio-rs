@@ -23,6 +23,7 @@ class FluidAudioBridgeInternal {
     private var vadManager: VadManager?
     private var diarizerManager: OfflineDiarizerManager?
     private var streamingAsrManager: SlidingWindowAsrManager?
+    private var nemotronStreamingManager: StreamingNemotronAsrManager?
     private var kokoroManager: KokoroAneManager?
     // Model-path diarization: retain the loaded MLModel (the ~4s-to-load part) keyed by
     // model path so repeated in-process diarize calls skip the reload. Guarded by a lock
@@ -546,12 +547,19 @@ class FluidAudioBridgeInternal {
         }
     }
 
-    func streamingAsrFeed(_ samples: [Float]) throws {
+    /// Feed a chunk of 16kHz mono audio and return the current best hypothesis.
+    ///
+    /// Returns `nil` when the window has not decoded anything yet — the sliding
+    /// window decodes far less often than chunks arrive, so most feeds produce
+    /// no new text. Callers use this for a live preview only; `streamingAsrFinish()`
+    /// remains the authoritative transcript.
+    func streamingAsrFeed(_ samples: [Float]) throws -> String? {
         guard let manager = streamingAsrManager else {
             throw BridgeError.notInitialized
         }
 
         let semaphore = DispatchSemaphore(value: 0)
+        var partial: String?
 
         Task {
             // Convert samples to AVAudioPCMBuffer
@@ -565,10 +573,21 @@ class FluidAudioBridgeInternal {
             }
 
             await manager.streamAudio(buffer)
+
+            // Confirmed text plus the still-volatile tail is the best current
+            // hypothesis. Concatenated in that order — `confirmedTranscript`
+            // is the settled prefix.
+            let confirmed = await manager.confirmedTranscript
+            let volatileTail = await manager.volatileTranscript
+            let combined = (confirmed + volatileTail).trimmingCharacters(in: .whitespaces)
+            partial = combined.isEmpty ? nil : combined
+
             semaphore.signal()
         }
 
         semaphore.wait()
+
+        return partial
     }
 
     func streamingAsrFinish() throws -> String {
@@ -649,6 +668,143 @@ class FluidAudioBridgeInternal {
 
     func isStreamingAsrAvailable() -> Bool {
         return streamingAsrManager != nil
+    }
+
+    // MARK: - Nemotron Streaming ASR
+
+    /// Load the Nemotron Speech Streaming 0.6B pipeline.
+    ///
+    /// Models are downloaded from Hugging Face on first use and cached under
+    /// Application Support. Unlike Parakeet there is no separate one-shot
+    /// model — the streaming pipeline serves both paths.
+    func initializeNemotronStreaming() throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        var initError: Error?
+
+        Task {
+            do {
+                let manager = StreamingNemotronAsrManager()
+                try await manager.loadModels()
+                self.nemotronStreamingManager = manager
+            } catch {
+                initError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = initError {
+            throw error
+        }
+    }
+
+    /// Feed a chunk of 16kHz mono audio, returning the text decoded from it.
+    func nemotronStreamingProcess(_ samples: [Float]) throws -> String {
+        guard let manager = nemotronStreamingManager else {
+            throw BridgeError.notInitialized
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: String?
+        var processError: Error?
+
+        Task {
+            do {
+                let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+                let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: UInt32(samples.count))!
+                buffer.frameLength = UInt32(samples.count)
+
+                let channelData = buffer.floatChannelData![0]
+                for (i, sample) in samples.enumerated() {
+                    channelData[i] = sample
+                }
+
+                result = try await manager.process(audioBuffer: buffer)
+            } catch {
+                processError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = processError {
+            throw error
+        }
+
+        return result ?? ""
+    }
+
+    /// Current accumulated hypothesis, for live preview between chunks.
+    func nemotronStreamingGetPartial() throws -> String {
+        guard let manager = nemotronStreamingManager else {
+            throw BridgeError.notInitialized
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: String?
+
+        Task {
+            result = await manager.getPartialTranscript()
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        return result ?? ""
+    }
+
+    /// Flush any buffered audio and return the final transcript.
+    func nemotronStreamingFinish() throws -> String {
+        guard let manager = nemotronStreamingManager else {
+            throw BridgeError.notInitialized
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: String?
+        var finishError: Error?
+
+        Task {
+            do {
+                result = try await manager.finish()
+            } catch {
+                finishError = error
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+
+        if let error = finishError {
+            throw error
+        }
+
+        return result ?? ""
+    }
+
+    /// Clear encoder/decoder cache state for a new session.
+    ///
+    /// The manager is reused across recordings and accumulates state, so this
+    /// must run between sessions. It keeps the models loaded — unlike
+    /// `cleanup()`, which releases them.
+    func nemotronStreamingReset() throws {
+        guard let manager = nemotronStreamingManager else {
+            throw BridgeError.notInitialized
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+
+        Task {
+            await manager.reset()
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+    }
+
+    func isNemotronStreamingAvailable() -> Bool {
+        return nemotronStreamingManager != nil
     }
 
     // MARK: - Qwen3 ASR
@@ -1004,6 +1160,7 @@ class FluidAudioBridgeInternal {
         sortformerModelCache.removeAll()
         sortformerCacheLock.unlock()
         streamingAsrManager = nil
+        nemotronStreamingManager = nil
         kokoroManager = nil
         qwen3AsrManagerStorage = nil
         qwen3StreamingManagerStorage = nil
@@ -1162,7 +1319,8 @@ public func fluidaudio_streaming_asr_start(_ ptr: UnsafeMutableRawPointer?) -> I
 public func fluidaudio_streaming_asr_feed(
     _ ptr: UnsafeMutableRawPointer?,
     _ samples: UnsafePointer<Float>?,
-    _ count: UInt32
+    _ count: UInt32,
+    _ outPartialText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 ) -> Int32 {
     guard let ptr = ptr, let samples = samples else { return -1 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
@@ -1170,7 +1328,16 @@ public func fluidaudio_streaming_asr_feed(
     let samplesArray = Array(UnsafeBufferPointer(start: samples, count: Int(count)))
 
     do {
-        try bridge.streamingAsrFeed(samplesArray)
+        let partialText = try bridge.streamingAsrFeed(samplesArray)
+
+        if let outPartialText = outPartialText {
+            if let text = partialText {
+                outPartialText.pointee = strdup(text)
+            } else {
+                outPartialText.pointee = nil
+            }
+        }
+
         return 0
     } catch {
         print("Streaming ASR feed error: \(error)")
@@ -1241,6 +1408,111 @@ public func fluidaudio_is_streaming_asr_available(_ ptr: UnsafeMutableRawPointer
     guard let ptr = ptr else { return 0 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
     return bridge.isStreamingAsrAvailable() ? 1 : 0
+}
+
+// MARK: - Nemotron Streaming FFI
+
+@_cdecl("fluidaudio_initialize_nemotron_streaming")
+public func fluidaudio_initialize_nemotron_streaming(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        try bridge.initializeNemotronStreaming()
+        return 0
+    } catch {
+        print("Nemotron streaming init error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_nemotron_streaming_process")
+public func fluidaudio_nemotron_streaming_process(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ samples: UnsafePointer<Float>?,
+    _ count: UInt32,
+    _ outText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr, let samples = samples else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+
+    let samplesArray = Array(UnsafeBufferPointer(start: samples, count: Int(count)))
+
+    do {
+        let text = try bridge.nemotronStreamingProcess(samplesArray)
+
+        if let outText = outText {
+            outText.pointee = strdup(text)
+        }
+
+        return 0
+    } catch {
+        print("Nemotron streaming process error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_nemotron_streaming_get_partial")
+public func fluidaudio_nemotron_streaming_get_partial(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ outText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+
+    do {
+        let text = try bridge.nemotronStreamingGetPartial()
+
+        if let outText = outText {
+            outText.pointee = strdup(text)
+        }
+
+        return 0
+    } catch {
+        print("Nemotron streaming get_partial error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_nemotron_streaming_finish")
+public func fluidaudio_nemotron_streaming_finish(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ outText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+
+    do {
+        let text = try bridge.nemotronStreamingFinish()
+
+        if let outText = outText {
+            outText.pointee = strdup(text)
+        }
+
+        return 0
+    } catch {
+        print("Nemotron streaming finish error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_nemotron_streaming_reset")
+public func fluidaudio_nemotron_streaming_reset(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        try bridge.nemotronStreamingReset()
+        return 0
+    } catch {
+        print("Nemotron streaming reset error: \(error)")
+        return -1
+    }
+}
+
+@_cdecl("fluidaudio_is_nemotron_streaming_available")
+public func fluidaudio_is_nemotron_streaming_available(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return 0 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    return bridge.isNemotronStreamingAvailable() ? 1 : 0
 }
 
 // MARK: - VAD FFI

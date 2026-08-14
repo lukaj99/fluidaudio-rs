@@ -149,6 +149,19 @@ fn streaming_asr_session_methods_error_before_init() {
     assert!(audio.streaming_asr_finish().is_err());
 }
 
+/// Same as above for the Nemotron streaming session methods. `reset` is
+/// included because the streaming feeder calls it on teardown, so it must fail
+/// cleanly on an uninitialized bridge rather than trapping.
+#[test]
+fn nemotron_streaming_session_methods_error_before_init() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    assert!(!audio.is_nemotron_streaming_available());
+    assert!(audio.nemotron_streaming_process(&[0.0_f32; 1600]).is_err());
+    assert!(audio.nemotron_streaming_get_partial().is_err());
+    assert!(audio.nemotron_streaming_finish().is_err());
+    assert!(audio.nemotron_streaming_reset().is_err());
+}
+
 /// Same as above for the Qwen3 streaming session methods. On macOS 14 these
 /// will fail because Qwen3 requires macOS 15; on macOS 15+ they fail because
 /// the manager isn't initialized. Either way, no crash, just an error.

@@ -39,6 +39,7 @@ extern "C" {
         bridge: *mut std::ffi::c_void,
         samples: *const f32,
         count: u32,
+        out_partial_text: *mut *mut i8,
     ) -> i32;
     fn fluidaudio_streaming_asr_finish(
         bridge: *mut std::ffi::c_void,
@@ -54,6 +55,24 @@ extern "C" {
         out_rtfx: *mut f32,
     ) -> i32;
     fn fluidaudio_is_streaming_asr_available(bridge: *mut std::ffi::c_void) -> i32;
+
+    fn fluidaudio_initialize_nemotron_streaming(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_nemotron_streaming_process(
+        bridge: *mut std::ffi::c_void,
+        samples: *const f32,
+        count: u32,
+        out_text: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_nemotron_streaming_get_partial(
+        bridge: *mut std::ffi::c_void,
+        out_text: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_nemotron_streaming_finish(
+        bridge: *mut std::ffi::c_void,
+        out_text: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_nemotron_streaming_reset(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_is_nemotron_streaming_available(bridge: *mut std::ffi::c_void) -> i32;
 
     // VAD
     fn fluidaudio_initialize_vad(bridge: *mut std::ffi::c_void, threshold: f32) -> i32;
@@ -467,14 +486,30 @@ impl FluidAudioBridge {
         }
     }
 
-    pub fn streaming_asr_feed(&self, samples: &[f32]) -> Result<(), String> {
+    pub fn streaming_asr_feed(&self, samples: &[f32]) -> Result<Option<String>, String> {
+        let mut partial_text_ptr: *mut i8 = std::ptr::null_mut();
+
         let result = unsafe {
-            fluidaudio_streaming_asr_feed(self.ptr, samples.as_ptr(), samples.len() as u32)
+            fluidaudio_streaming_asr_feed(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as u32,
+                &mut partial_text_ptr,
+            )
         };
-        if result == 0 {
-            Ok(())
+
+        if result != 0 {
+            return Err("Failed to feed samples to streaming ASR".to_string());
+        }
+
+        if partial_text_ptr.is_null() {
+            Ok(None)
         } else {
-            Err("Failed to feed samples to streaming ASR".to_string())
+            let text = unsafe { CStr::from_ptr(partial_text_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { fluidaudio_free_string(partial_text_ptr) };
+            Ok(Some(text))
         }
     }
 
@@ -546,6 +581,84 @@ impl FluidAudioBridge {
 
     pub fn is_streaming_asr_available(&self) -> bool {
         unsafe { fluidaudio_is_streaming_asr_available(self.ptr) != 0 }
+    }
+
+    pub fn initialize_nemotron_streaming(&self) -> Result<(), String> {
+        let result = unsafe { fluidaudio_initialize_nemotron_streaming(self.ptr) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("Failed to initialize Nemotron streaming ASR".to_string())
+        }
+    }
+
+    pub fn nemotron_streaming_process(&self, samples: &[f32]) -> Result<String, String> {
+        let mut text_ptr: *mut i8 = std::ptr::null_mut();
+
+        let result = unsafe {
+            fluidaudio_nemotron_streaming_process(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as u32,
+                &mut text_ptr,
+            )
+        };
+
+        if result != 0 {
+            return Err("Failed to process samples with Nemotron streaming".to_string());
+        }
+
+        Ok(Self::take_string(text_ptr))
+    }
+
+    pub fn nemotron_streaming_get_partial(&self) -> Result<String, String> {
+        let mut text_ptr: *mut i8 = std::ptr::null_mut();
+
+        let result = unsafe { fluidaudio_nemotron_streaming_get_partial(self.ptr, &mut text_ptr) };
+
+        if result != 0 {
+            return Err("Failed to read Nemotron partial transcript".to_string());
+        }
+
+        Ok(Self::take_string(text_ptr))
+    }
+
+    pub fn nemotron_streaming_finish(&self) -> Result<String, String> {
+        let mut text_ptr: *mut i8 = std::ptr::null_mut();
+
+        let result = unsafe { fluidaudio_nemotron_streaming_finish(self.ptr, &mut text_ptr) };
+
+        if result != 0 {
+            return Err("Failed to finish Nemotron streaming session".to_string());
+        }
+
+        Ok(Self::take_string(text_ptr))
+    }
+
+    pub fn nemotron_streaming_reset(&self) -> Result<(), String> {
+        let result = unsafe { fluidaudio_nemotron_streaming_reset(self.ptr) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("Failed to reset Nemotron streaming session".to_string())
+        }
+    }
+
+    pub fn is_nemotron_streaming_available(&self) -> bool {
+        unsafe { fluidaudio_is_nemotron_streaming_available(self.ptr) != 0 }
+    }
+
+    /// Copy a `strdup`-owned C string out of the bridge and free the original.
+    ///
+    /// A null pointer means "no text", not an error — Swift leaves the out
+    /// param untouched when there is nothing to report.
+    fn take_string(ptr: *mut i8) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        unsafe { fluidaudio_free_string(ptr) };
+        text
     }
 
     pub fn initialize_vad(&self, threshold: f32) -> Result<(), String> {

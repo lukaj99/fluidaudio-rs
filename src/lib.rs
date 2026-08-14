@@ -207,7 +207,16 @@ impl FluidAudio {
     ///
     /// Call this multiple times to process audio in chunks. The transcription engine
     /// will process the audio incrementally.
-    pub fn streaming_asr_feed(&self, samples: &[f32]) -> Result<(), FluidAudioError> {
+    ///
+    /// # Returns
+    /// * `Some(String)` — the current best hypothesis (confirmed prefix plus the
+    ///   volatile tail), suitable for a live preview
+    /// * `None` — the sliding window has not decoded anything new yet
+    ///
+    /// The window decodes far less often than chunks arrive, so most calls
+    /// return `None`. Use [`streaming_asr_finish`](Self::streaming_asr_finish)
+    /// for the authoritative transcript.
+    pub fn streaming_asr_feed(&self, samples: &[f32]) -> Result<Option<String>, FluidAudioError> {
         self.bridge
             .streaming_asr_feed(samples)
             .map_err(FluidAudioError::from)
@@ -271,6 +280,68 @@ impl FluidAudio {
     /// Check if streaming ASR is initialized and ready
     pub fn is_streaming_asr_available(&self) -> bool {
         self.bridge.is_streaming_asr_available()
+    }
+
+    // ========== Nemotron Streaming ASR Methods ==========
+
+    /// Initialize the Nemotron Speech Streaming 0.6B pipeline
+    ///
+    /// Models are downloaded from Hugging Face on first use and cached under
+    /// Application Support. Nemotron has no separate one-shot model — the
+    /// streaming pipeline serves both the live and batch paths.
+    pub fn init_nemotron_streaming(&self) -> Result<(), FluidAudioError> {
+        self.bridge
+            .initialize_nemotron_streaming()
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Feed audio samples to the Nemotron streaming session
+    ///
+    /// # Arguments
+    /// * `samples` - Slice of f32 audio samples (16kHz mono, normalized to -1.0 to 1.0)
+    ///
+    /// # Returns
+    /// * `String` containing the text decoded from this chunk (empty when the
+    ///   chunk produced no new tokens)
+    pub fn nemotron_streaming_process(&self, samples: &[f32]) -> Result<String, FluidAudioError> {
+        self.bridge
+            .nemotron_streaming_process(samples)
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Read the accumulated hypothesis without advancing the session
+    ///
+    /// Intended for live preview between [`nemotron_streaming_process`](Self::nemotron_streaming_process)
+    /// calls. Returns an empty string before anything has been decoded.
+    pub fn nemotron_streaming_get_partial(&self) -> Result<String, FluidAudioError> {
+        self.bridge
+            .nemotron_streaming_get_partial()
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Flush buffered audio and return the final transcript
+    ///
+    /// Call [`nemotron_streaming_reset`](Self::nemotron_streaming_reset) afterwards
+    /// before starting another session.
+    pub fn nemotron_streaming_finish(&self) -> Result<String, FluidAudioError> {
+        self.bridge
+            .nemotron_streaming_finish()
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Clear encoder/decoder cache state for a new session
+    ///
+    /// The models stay loaded. A session left un-reset carries its state into
+    /// the next one, so call this between recordings.
+    pub fn nemotron_streaming_reset(&self) -> Result<(), FluidAudioError> {
+        self.bridge
+            .nemotron_streaming_reset()
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Check if Nemotron streaming ASR is initialized and ready
+    pub fn is_nemotron_streaming_available(&self) -> bool {
+        self.bridge.is_nemotron_streaming_available()
     }
 
     // ========== VAD Methods ==========
