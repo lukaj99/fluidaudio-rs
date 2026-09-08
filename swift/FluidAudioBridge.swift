@@ -498,6 +498,36 @@ class FluidAudioBridgeInternal {
 
     // MARK: - Streaming ASR
 
+    /// Sliding-window settings for a *live preview* stream.
+    ///
+    /// `SlidingWindowAsrConfig.default` is unusable here on two counts:
+    ///
+    ///  * Its window is `left + chunk + right` = 10 + 15 + 2 = 27s, and even the
+    ///    per-decode span of `chunk + right` = 17s overruns the Parakeet encoder's
+    ///    fixed 15s (240 000-sample) input, so *every* mid-stream window decode
+    ///    throws `MultiArray shape (1 x 272000) does not match (1 x 240000)` and
+    ///    no partial is ever produced — only `finish()` returns text.
+    ///  * Even if it fit, a 15s chunk means the first live hypothesis lands 17s
+    ///    into the utterance, which is longer than most dictations.
+    ///
+    /// 4 + 2 + 0.5 = 6.5s stays well inside the encoder limit and yields a fresh
+    /// hypothesis roughly every 2s. `minContextForConfirmation: 0` lets each
+    /// window promote into `confirmedTranscript` immediately, so the preview
+    /// *accumulates* instead of showing only the most recent chunk (below the
+    /// confirmation threshold the manager overwrites `volatileTranscript` and
+    /// the earlier text disappears from the hypothesis).
+    ///
+    /// This affects the preview only — VoiceFlow's authoritative transcript
+    /// comes from a fresh one-shot decode of the full buffered audio.
+    private static let previewStreamingConfig = SlidingWindowAsrConfig(
+        chunkSeconds: 2.0,
+        hypothesisChunkSeconds: 1.0,
+        leftContextSeconds: 4.0,
+        rightContextSeconds: 0.5,
+        minContextForConfirmation: 0.0,
+        confirmationThreshold: 0.0
+    )
+
     func initializeStreamingAsr() throws {
         let semaphore = DispatchSemaphore(value: 0)
         var initError: Error?
@@ -507,7 +537,7 @@ class FluidAudioBridgeInternal {
                 let models = try await AsrModels.downloadAndLoad()
                 self.asrModels = models
 
-                let manager = SlidingWindowAsrManager()
+                let manager = SlidingWindowAsrManager(config: Self.previewStreamingConfig)
                 try await manager.loadModels(models)
                 self.streamingAsrManager = manager
             } catch {
@@ -523,17 +553,34 @@ class FluidAudioBridgeInternal {
         }
     }
 
+    /// Begin a streaming session, replacing the previous manager instance.
+    ///
+    /// `SlidingWindowAsrManager` is single-use: its input `AsyncStream` is built
+    /// once in `init` and permanently terminated by `finish()`/`cancel()`, and
+    /// neither `startStreaming()` nor `finish()` clears `confirmedTranscript` /
+    /// `volatileTranscript`. Reusing one instance for a second session therefore
+    /// silently drops every fed buffer *and* keeps replaying the previous
+    /// session's transcript as the live hypothesis. Build a fresh manager per
+    /// session instead — `loadModels(_:)` on already-loaded `AsrModels` is just
+    /// pointer assignment, so this costs nothing.
     func streamingAsrStart() throws {
-        guard let manager = streamingAsrManager else {
+        guard streamingAsrManager != nil, let models = asrModels else {
             throw BridgeError.notInitialized
         }
+        let previous = streamingAsrManager
 
         let semaphore = DispatchSemaphore(value: 0)
         var startError: Error?
 
         Task {
+            // Tear down the prior session's recognition task if it was
+            // abandoned without a finish() (cancel is idempotent after one).
+            await previous?.cancel()
             do {
+                let manager = SlidingWindowAsrManager(config: Self.previewStreamingConfig)
+                try await manager.loadModels(models)
                 try await manager.startStreaming(source: .microphone)
+                self.streamingAsrManager = manager
             } catch {
                 startError = error
             }
@@ -576,10 +623,12 @@ class FluidAudioBridgeInternal {
 
             // Confirmed text plus the still-volatile tail is the best current
             // hypothesis. Concatenated in that order — `confirmedTranscript`
-            // is the settled prefix.
+            // is the settled prefix. Space-joined (matching the manager's own
+            // `finish()`); plain `+` welds the halves into "world.This is".
             let confirmed = await manager.confirmedTranscript
             let volatileTail = await manager.volatileTranscript
-            let combined = (confirmed + volatileTail).trimmingCharacters(in: .whitespaces)
+            let parts = [confirmed, volatileTail].filter { !$0.isEmpty }
+            let combined = parts.joined(separator: " ").trimmingCharacters(in: .whitespaces)
             partial = combined.isEmpty ? nil : combined
 
             semaphore.signal()
