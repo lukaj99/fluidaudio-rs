@@ -763,14 +763,18 @@ class FluidAudioBridgeInternal {
     /// Application Support. Unlike Parakeet there is no separate one-shot
     /// model — the streaming pipeline serves both paths.
     func initializeNemotronStreaming() throws {
+        // FluidAudio's default tier became 2240 ms in 0.15.1; keep the 1120 ms
+        // tier (and its existing `nemotron-streaming/1120ms` cache).
+        let chunkSize = NemotronChunkSize.ms1120
+        Self.removeStaleNemotronCache(
+            at: MLModelConfigurationUtils.defaultModelsDirectory(for: chunkSize.repo))
+
         let semaphore = DispatchSemaphore(value: 0)
         var initError: Error?
 
         Task {
             do {
-                // FluidAudio's default tier became 2240 ms in 0.15.1; keep the
-                // 1120 ms tier (and its existing `nemotron-streaming/1120ms` cache).
-                let manager = StreamingNemotronAsrManager(requestedChunkSize: .ms1120)
+                let manager = StreamingNemotronAsrManager(requestedChunkSize: chunkSize)
                 try await manager.loadModels()
                 self.nemotronStreamingManager = manager
             } catch {
@@ -787,6 +791,36 @@ class FluidAudioBridgeInternal {
     }
 
     /// Feed a chunk of 16kHz mono audio, returning the text decoded from it.
+    /// Delete a Nemotron chunk folder (e.g. `Models/nemotron-streaming/1120ms`)
+    /// if any compiled model in it lacks `model.mil`, so FluidAudio downloads
+    /// the folder fresh.
+    ///
+    /// Caches downloaded under FluidAudio 0.14.x can hold a
+    /// `decoder_joint.mlmodelc` without `model.mil`. FluidAudio 0.17.7's cache
+    /// check only looks for `coremldata.bin`, so it loads the bundle, and
+    /// Core ML crashes the process (EXC_BAD_ACCESS) instead of throwing, which
+    /// means FluidAudio's purge-and-redownload never runs.
+    static func removeStaleNemotronCache(at chunkFolder: URL) {
+        let fileManager = FileManager.default
+        guard let walker = fileManager.enumerator(at: chunkFolder, includingPropertiesForKeys: nil) else {
+            return
+        }
+        var broken: [String] = []
+        for case let url as URL in walker where url.pathExtension == "mlmodelc" {
+            walker.skipDescendants()
+            if !fileManager.fileExists(atPath: url.appendingPathComponent("model.mil").path) {
+                broken.append(url.lastPathComponent)
+            }
+        }
+        guard !broken.isEmpty else { return }
+        do {
+            try fileManager.removeItem(at: chunkFolder)
+            print("FluidAudioBridge: removed stale Nemotron cache \(chunkFolder.path): no model.mil in \(broken.joined(separator: ", "))")
+        } catch {
+            print("FluidAudioBridge: could not remove stale Nemotron cache \(chunkFolder.path): \(error)")
+        }
+    }
+
     func nemotronStreamingProcess(_ samples: [Float]) throws -> String {
         guard let manager = nemotronStreamingManager else {
             throw BridgeError.notInitialized

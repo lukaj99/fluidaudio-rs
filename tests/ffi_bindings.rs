@@ -521,6 +521,7 @@ const SCRATCH_CHILD: &str = "FLUIDAUDIO_RS_SCRATCH_CHILD";
 const UNIFIED: &str = "parakeet-unified-en-0.6b";
 const PREVIEW_PARENT: &str = "parakeet-unified-preview";
 const OFFLINE_ENCODER_WEIGHTS: &str = "parakeet_unified_encoder_int8.mlmodelc/weights/weight.bin";
+const NEMOTRON_1120: &str = "nemotron-streaming/1120ms";
 const STREAMING_ENCODER: &str = "parakeet_unified_encoder_streaming_70_13_13_int8.mlmodelc";
 
 fn models_dir(home: &std::path::Path) -> std::path::PathBuf {
@@ -724,6 +725,76 @@ fn scratch_child_one_shot_during_preview_download() {
     assert!(
         preview.join().unwrap().is_err(),
         "the preview load cannot succeed offline"
+    );
+}
+
+/// A Nemotron cache from FluidAudio 0.14.x whose `decoder_joint.mlmodelc` has
+/// no `model.mil` must be replaced, not loaded: Core ML crashes on it. The
+/// scratch home gets a clone of the real `nemotron-streaming/1120ms` folder
+/// with that file removed (the real cache is never touched or loaded), so the
+/// child downloads the folder afresh.
+#[test]
+#[ignore = "needs a real nemotron-streaming/1120ms cache and downloads it again (~600 MB)"]
+fn stale_nemotron_cache_is_replaced_instead_of_crashing() {
+    let real =
+        models_dir(&std::path::PathBuf::from(std::env::var("HOME").unwrap())).join(NEMOTRON_1120);
+    assert!(real.exists(), "no Nemotron cache at {real:?} to copy");
+    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("nemotron-stale-home");
+    let _ = std::fs::remove_dir_all(&home);
+    let chunk = models_dir(&home).join(NEMOTRON_1120);
+    std::fs::create_dir_all(chunk.parent().unwrap()).unwrap();
+    let status = std::process::Command::new("cp")
+        .arg("-cR")
+        .arg(&real)
+        .arg(&chunk)
+        .status()
+        .expect("run cp");
+    assert!(status.success(), "cloning {real:?} failed");
+    // Unlinking in the clone leaves the real folder as it is.
+    let program = chunk.join("decoder_joint.mlmodelc/model.mil");
+    if program.exists() {
+        std::fs::remove_file(&program).unwrap();
+    }
+
+    run_child("scratch_child_stale_nemotron_cache", &home, &[]);
+
+    // Every bundle of the fresh download has a program, so the next init
+    // keeps the folder instead of deleting it again.
+    let bundles = std::process::Command::new("find")
+        .arg(&chunk)
+        .args(["-name", "*.mlmodelc", "-type", "d"])
+        .output()
+        .expect("run find");
+    let bundles = String::from_utf8(bundles.stdout).unwrap();
+    assert!(
+        bundles.lines().count() >= 4,
+        "fresh download missing: {bundles}"
+    );
+    for bundle in bundles.lines() {
+        let program = std::path::Path::new(bundle).join("model.mil");
+        assert!(program.exists(), "{bundle} has no model.mil");
+    }
+}
+
+#[test]
+#[ignore = "child of stale_nemotron_cache_is_replaced_instead_of_crashing"]
+fn scratch_child_stale_nemotron_cache() {
+    if !is_scratch_child("scratch_child_stale_nemotron_cache") {
+        return;
+    }
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio
+        .init_nemotron_streaming()
+        .expect("Nemotron init from the scratch home");
+    for chunk in jfk_samples().chunks(17_920) {
+        audio.nemotron_streaming_process(chunk).expect("process");
+    }
+    let text = audio.nemotron_streaming_finish().expect("finish");
+    println!("Nemotron transcript: {text:?}");
+    assert!(
+        text.to_lowercase()
+            .contains("ask not what your country can do for you"),
+        "unexpected transcript {text:?}"
     );
 }
 
