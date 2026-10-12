@@ -21,6 +21,15 @@ extern "C" {
         out_rtfx: *mut f32,
     ) -> i32;
     fn fluidaudio_is_asr_available(bridge: *mut std::ffi::c_void) -> i32;
+
+    // Vocabulary boosting (one-shot ASR)
+    fn fluidaudio_set_vocabulary(
+        bridge: *mut std::ffi::c_void,
+        terms: *const *const i8,
+        count: u32,
+        out_error: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_clear_vocabulary(bridge: *mut std::ffi::c_void);
     fn fluidaudio_transcribe_samples(
         bridge: *mut std::ffi::c_void,
         samples: *const f32,
@@ -420,6 +429,24 @@ impl FluidAudioBridge {
 
     pub fn is_asr_available(&self) -> bool {
         unsafe { fluidaudio_is_asr_available(self.ptr) != 0 }
+    }
+
+    pub fn set_vocabulary(&self, terms: &[String]) -> Result<(), String> {
+        let c_terms = terms
+            .iter()
+            .map(|term| CString::new(term.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "Invalid vocabulary term (NUL byte)")?;
+        let ptrs: Vec<*const i8> = c_terms.iter().map(|term| term.as_ptr()).collect();
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
+        let status = unsafe {
+            fluidaudio_set_vocabulary(self.ptr, ptrs.as_ptr(), ptrs.len() as u32, &mut error_ptr)
+        };
+        check_status(status, error_ptr, "Failed to set vocabulary")
+    }
+
+    pub fn clear_vocabulary(&self) {
+        unsafe { fluidaudio_clear_vocabulary(self.ptr) };
     }
 
     pub fn initialize_streaming_asr(&self) -> Result<(), String> {
@@ -907,6 +934,18 @@ unsafe fn collect_vad_frames(
 
     fluidaudio_free_vad_result(probs_ptr, voice_ptr, times_ptr, count);
     frames
+}
+
+/// `Ok` for status 0; otherwise an error naming `context` and the Swift error
+/// the bridge reported through its `out_error` parameter (freed here).
+fn check_status(status: i32, error_ptr: *mut i8, context: &str) -> Result<(), String> {
+    // SAFETY: the bridge sets `out_error` to NULL or a `strdup`ed string.
+    let detail = unsafe { take_c_string(error_ptr) };
+    match (status, detail.is_empty()) {
+        (0, _) => Ok(()),
+        (_, true) => Err(context.to_string()),
+        (_, false) => Err(format!("{context}: {detail}")),
+    }
 }
 
 /// SAFETY: `ptr` must be either NULL or a C string allocated by the Swift bridge

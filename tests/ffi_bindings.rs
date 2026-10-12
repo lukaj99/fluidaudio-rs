@@ -508,6 +508,70 @@ fn one_shot_runs_during_streaming_load_and_sessions() {
     );
 }
 
+/// Speak `text` with macOS `say` into a 16 kHz mono 16-bit WAV named `name`
+/// under the test target's temp dir, and return its path.
+fn say_wav(name: &str, text: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let status = std::process::Command::new("say")
+        .args([
+            "-v",
+            "Samantha",
+            "--file-format=WAVE",
+            "--data-format=LEI16@16000",
+            "-o",
+        ])
+        .arg(&path)
+        .arg(text)
+        .status()
+        .expect("run say");
+    assert!(status.success(), "say failed");
+    path
+}
+
+/// Vocabulary terms the one-shot model does not know come out right once
+/// boosted, and clearing the vocabulary restores the plain transcript.
+#[test]
+#[ignore = "downloads Parakeet Unified EN 0.6B (~614 MB) and Parakeet CTC 110M (~97.5 MB)"]
+fn vocabulary_boosting_recovers_unusual_terms() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio.init_asr().expect("ASR init");
+    let clip = say_wav(
+        "vocabulary.wav",
+        "Prescribe tranexamic acid and ondansetron.",
+    );
+
+    let plain = audio.transcribe_file(&clip).expect("plain").text;
+    audio
+        .set_vocabulary(&["tranexamic acid".to_string(), "ondansetron".to_string()])
+        .expect("set vocabulary");
+    let boosted = audio.transcribe_file(&clip).expect("boosted").text;
+    audio.clear_vocabulary();
+    let cleared = audio.transcribe_file(&clip).expect("cleared").text;
+    println!("without vocabulary: {plain:?}\nwith vocabulary:    {boosted:?}\ncleared:            {cleared:?}");
+
+    let lower = boosted.to_lowercase();
+    assert!(
+        lower.contains("tranexamic acid") && lower.contains("ondansetron"),
+        "boosted transcript lacks the terms: {boosted:?}"
+    );
+    assert_eq!(
+        cleared, plain,
+        "clear_vocabulary must restore the plain transcript"
+    );
+}
+
+/// Setting an empty vocabulary needs no model and is the same as clearing it.
+#[test]
+fn empty_vocabulary_clears_without_loading_a_model() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio.set_vocabulary(&[]).expect("empty vocabulary");
+    audio
+        .set_vocabulary(&["  ".to_string()])
+        .expect("blank vocabulary");
+    audio.clear_vocabulary();
+    assert!(audio.set_vocabulary(&["a\0b".to_string()]).is_err());
+}
+
 // ---- Scratch-home tests ---------------------------------------------------
 //
 // FluidAudio always resolves its model folders under Application Support, and

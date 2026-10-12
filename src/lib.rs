@@ -153,6 +153,36 @@ impl FluidAudio {
         self.bridge.is_asr_available()
     }
 
+    // ========== Vocabulary Boosting ==========
+
+    /// Boost recognition of `terms` (names, jargon, drug names) in one-shot
+    /// transcription: [`transcribe_samples`](Self::transcribe_samples) and
+    /// [`transcribe_file`](Self::transcribe_file). Streaming is unaffected.
+    ///
+    /// The first call downloads and loads Parakeet CTC 110M (~97.5 MB) into
+    /// `~/Library/Application Support/FluidAudio/Models/parakeet-ctc-110m-coreml`;
+    /// the bridge keeps it loaded. After each transcription a CTC pass over
+    /// the same audio scores the terms, and a term replaces the words it was
+    /// misheard as only when the audio supports it better than those words.
+    /// Terms are matched case-insensitively and written out as given. Terms
+    /// carry no weights: FluidAudio sets the boost from the vocabulary size.
+    ///
+    /// Replaces any earlier vocabulary. Blank terms are ignored, and a list
+    /// with no terms clears the vocabulary. Safe to call while other threads
+    /// transcribe: a transcription uses the vocabulary set when it started,
+    /// and the last `set_vocabulary`/`clear_vocabulary` call wins. Blocks until
+    /// the CTC model is loaded.
+    pub fn set_vocabulary(&self, terms: &[String]) -> Result<(), FluidAudioError> {
+        self.bridge
+            .set_vocabulary(terms)
+            .map_err(FluidAudioError::from)
+    }
+
+    /// Stop boosting vocabulary in one-shot transcription.
+    pub fn clear_vocabulary(&self) {
+        self.bridge.clear_vocabulary()
+    }
+
     // ========== Streaming ASR Methods ==========
 
     /// Initialize Streaming ASR for live partial transcripts

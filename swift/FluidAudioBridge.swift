@@ -41,6 +41,17 @@ class FluidAudioBridgeInternal {
     private static let oneShotLoadLock = NSLock()
     private static let previewLoadLock = NSLock()
 
+    // Vocabulary boosting for one-shot transcription. `vocabularyLock` guards
+    // only the published session and its generation, so a transcription never
+    // waits for a CTC model load; `vocabularyLoadLock` serializes the loads.
+    // Each set/clear bumps the generation, and a load publishes its session
+    // only if no later set/clear came in meanwhile: the last call wins.
+    private let vocabularyLock = NSLock()
+    private var vocabularyBoosting: VocabularyBoostingSession?
+    private var vocabularyGeneration = 0
+    private let vocabularyLoadLock = NSLock()
+    private var ctcModels: CtcModels?
+
     /// Base directory for the live-preview (streaming) engine:
     /// `~/Library/Application Support/FluidAudio/Models/parakeet-unified-preview`,
     /// so its files land in `parakeet-unified-preview/parakeet-unified-en-0.6b`
@@ -62,10 +73,16 @@ class FluidAudioBridgeInternal {
     private static let unifiedWeightsRepo = "FluidInference/parakeet-unified-en-0.6b-coreml"
     private static let unifiedWeightsRevision = "d32e972dd4315f1dc3f6be28fb2aab0ab3e80358"
 
-    /// Registers the pin once per process. `revisionOverrides` is process-wide,
-    /// so this merges one key instead of replacing the dictionary.
+    /// Hugging Face commit of the Parakeet CTC 110M weights vocabulary
+    /// boosting downloads.
+    private static let ctcWeightsRepo = "FluidInference/parakeet-ctc-110m-coreml"
+    private static let ctcWeightsRevision = "accdafd8cf8a2ff1cabe3c11e54416b405d409aa"
+
+    /// Registers the pins once per process. `revisionOverrides` is process-wide,
+    /// so this merges keys instead of replacing the dictionary.
     private static let pinUnifiedWeights: Void = {
         ModelRegistry.revisionOverrides[unifiedWeightsRepo] = unifiedWeightsRevision
+        ModelRegistry.revisionOverrides[ctcWeightsRepo] = ctcWeightsRevision
     }()
 
     init() {
@@ -133,6 +150,7 @@ class FluidAudioBridgeInternal {
             throw BridgeError.notInitialized
         }
         let padded = samples + [Float](repeating: 0, count: Self.alignPadding(sampleCount: samples.count))
+        let boosting = currentVocabularyBoosting()
 
         let semaphore = DispatchSemaphore(value: 0)
         var result: UnifiedAsrManager.TranscriptionWithTimings?
@@ -142,7 +160,16 @@ class FluidAudioBridgeInternal {
         Task {
             let start = DispatchTime.now()
             do {
-                result = try await manager.transcribeWithTimings(padded)
+                let decoded = try await manager.transcribeWithTimings(padded)
+                result = decoded
+                // The rescoring UnifiedAsrManager applies when boosting is
+                // configured on it, over the same padded audio and timings.
+                if let boosting,
+                    let rescored = await boosting.rescore(
+                        text: decoded.text, tokenTimings: decoded.tokenTimings, audioSamples: padded)
+                {
+                    result = .init(text: rescored.text, tokenTimings: decoded.tokenTimings)
+                }
             } catch {
                 transcribeError = error
             }
@@ -183,6 +210,90 @@ class FluidAudioBridgeInternal {
 
     func isAsrAvailable() -> Bool {
         return asrManager != nil
+    }
+
+    // MARK: - Vocabulary Boosting
+
+    /// Boost `terms` in one-shot transcription (`transcribeSamples`,
+    /// `transcribeFile`); streaming is unaffected.
+    ///
+    /// The first call downloads and loads Parakeet CTC 110M (~97.5 MB, into
+    /// `Application Support/FluidAudio/Models/parakeet-ctc-110m-coreml`),
+    /// which this bridge then keeps. Each term is tokenized with the CTC
+    /// tokenizer; a term that encodes to nothing is dropped. After every
+    /// transcription a CTC pass over the same audio scores the terms, and a
+    /// term replaces the words it was misheard as only when its acoustic
+    /// score beats theirs. That is `UnifiedAsrManager`'s own boosting, with
+    /// its default `VocabularyBoostingSession.itnDefaultConfig` (the #702
+    /// spotter-rescue similarity floors that this engine's ITN output needs).
+    /// The session lives on the bridge rather than on the manager because
+    /// `UnifiedAsrManager` has no way to unset it.
+    ///
+    /// Blank terms are ignored; no terms at all clears the vocabulary.
+    func setVocabulary(_ terms: [String]) throws {
+        let words = terms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let generation = startVocabularyChange()
+        guard !words.isEmpty else {
+            publishVocabularyBoosting(nil, generation: generation)
+            return
+        }
+
+        vocabularyLoadLock.lock()
+        defer { vocabularyLoadLock.unlock() }
+        let models = try ctcModels ?? Self.blocking { try await CtcModels.downloadAndLoad(variant: .ctc110m) }
+        ctcModels = models
+        let session = try Self.blocking {
+            try await VocabularyBoostingSession(
+                vocabulary: CustomVocabularyContext(terms: words.map { CustomVocabularyTerm(text: $0) }),
+                ctcModels: models,
+                config: VocabularyBoostingSession.itnDefaultConfig
+            )
+        }
+        publishVocabularyBoosting(session.vocabulary.terms.isEmpty ? nil : session, generation: generation)
+    }
+
+    func clearVocabulary() {
+        publishVocabularyBoosting(nil, generation: startVocabularyChange())
+    }
+
+    private func startVocabularyChange() -> Int {
+        vocabularyLock.lock()
+        defer { vocabularyLock.unlock() }
+        vocabularyGeneration += 1
+        return vocabularyGeneration
+    }
+
+    private func publishVocabularyBoosting(_ session: VocabularyBoostingSession?, generation: Int) {
+        vocabularyLock.lock()
+        defer { vocabularyLock.unlock() }
+        if generation == vocabularyGeneration {
+            vocabularyBoosting = session
+        }
+    }
+
+    private func currentVocabularyBoosting() -> VocabularyBoostingSession? {
+        vocabularyLock.lock()
+        defer { vocabularyLock.unlock() }
+        return vocabularyBoosting
+    }
+
+    /// Run `body` on the Swift concurrency pool and block the calling (FFI)
+    /// thread until it finishes.
+    private static func blocking<T>(_ body: @escaping () async throws -> T) throws -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<T, Error>?
+        Task {
+            do {
+                result = .success(try await body())
+            } catch {
+                result = .failure(error)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return try result!.get()
     }
 
     /// Map a kesha/espeak-style language tag to a KokoroAne variant. FluidAudio
@@ -1025,6 +1136,10 @@ class FluidAudioBridgeInternal {
     }
 
     func cleanup() {
+        clearVocabulary()
+        vocabularyLoadLock.lock()
+        ctcModels = nil
+        vocabularyLoadLock.unlock()
         asrManager = nil
         vadManager = nil
         diarizerManager = nil
@@ -1151,6 +1266,43 @@ public func fluidaudio_is_asr_available(_ ptr: UnsafeMutableRawPointer?) -> Int3
     guard let ptr = ptr else { return 0 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
     return bridge.isAsrAvailable() ? 1 : 0
+}
+
+/// Hand `error`'s description to the caller through `outError` (free it with
+/// `fluidaudio_free_string`) and return the failure status, -1.
+private func reportFailure(
+    _ error: Error, _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    outError?.pointee = strdup(String(describing: error))
+    return -1
+}
+
+// MARK: - Vocabulary Boosting FFI
+
+/// Boost `count` NUL-terminated `terms` in one-shot transcription. On failure
+/// returns -1 and sets `outError`.
+@_cdecl("fluidaudio_set_vocabulary")
+public func fluidaudio_set_vocabulary(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ terms: UnsafePointer<UnsafePointer<CChar>?>?,
+    _ count: UInt32,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    let words = (0..<Int(count)).compactMap { i in terms?[i].map { String(cString: $0) } }
+    do {
+        try bridge.setVocabulary(words)
+        return 0
+    } catch {
+        return reportFailure(error, outError)
+    }
+}
+
+@_cdecl("fluidaudio_clear_vocabulary")
+public func fluidaudio_clear_vocabulary(_ ptr: UnsafeMutableRawPointer?) {
+    guard let ptr = ptr else { return }
+    Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue().clearVocabulary()
 }
 
 // MARK: - Streaming ASR FFI
