@@ -111,12 +111,28 @@ class FluidAudioBridgeInternal {
         return try transcribeSamples(samples)
     }
 
+    /// Trailing zeros that bring `n` samples to `ceil(n / 1280) * 1280 + 160`,
+    /// i.e. a valid mel frame count of 8k + 1 (ALIGN).
+    ///
+    /// FluidAudio 0.17.7's Unified mel extractor declares `floor(n / 160)`
+    /// valid frames (UnifiedMelExtractor.swift:61-68). When that count mod 8
+    /// is 0 or 7, short clips decode to "" (every jfk prefix up to 1.04 s did).
+    /// Padding to 8k + 1 frames matches the framing FluidAudio's v2 path uses.
+    /// On real Speech Commands audio through VoiceFlow's app path (A/B G4c,
+    /// APP condition) it cut empty transcripts from 19.5% to 0.35% and raised
+    /// exact-match accuracy from 77.2% to 96.7%.
+    static func alignPadding(sampleCount n: Int) -> Int {
+        let target = (n + 1279) / 1280 * 1280 + 160
+        return target - n
+    }
+
     func transcribeSamples(_ samples: [Float]) throws -> (String, Float, Double, Double, Float) {
         // Nothing carries over between calls: the manager decodes every 15 s
         // window from a fresh RNNT decoder state.
         guard let manager = asrManager else {
             throw BridgeError.notInitialized
         }
+        let padded = samples + [Float](repeating: 0, count: Self.alignPadding(sampleCount: samples.count))
 
         let semaphore = DispatchSemaphore(value: 0)
         var result: UnifiedAsrManager.TranscriptionWithTimings?
@@ -126,7 +142,7 @@ class FluidAudioBridgeInternal {
         Task {
             let start = DispatchTime.now()
             do {
-                result = try await manager.transcribeWithTimings(samples)
+                result = try await manager.transcribeWithTimings(padded)
             } catch {
                 transcribeError = error
             }

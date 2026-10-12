@@ -431,6 +431,23 @@ fn jfk_samples() -> Vec<f32> {
     )
 }
 
+/// A short clip whose mel frame count, floor(n / 160), is 0 mod 8 must not
+/// decode to "". The first 15,360 samples (0.96 s, 96 frames) of jfk.wav came
+/// back "" before the bridge padded one-shot input to 8k + 1 frames (ALIGN).
+#[test]
+#[ignore = "downloads Parakeet Unified EN 0.6B (~614 MB) and triggers ANE compilation"]
+fn short_clip_at_frame_residue_zero_is_transcribed() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio.init_asr().expect("ASR init");
+    let clip = &jfk_samples()[..15_360];
+    let result = audio.transcribe_samples(clip).expect("transcribe");
+    assert_eq!(result.text, "And so");
+    assert_eq!(
+        result.duration, 0.96,
+        "duration must come from the unpadded clip"
+    );
+}
+
 /// One-shot transcription runs while the same bridge loads the live-preview
 /// engine and then runs streaming sessions: every one-shot call, and every
 /// streaming session, returns the solo transcript.
