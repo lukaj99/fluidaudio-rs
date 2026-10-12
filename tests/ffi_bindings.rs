@@ -11,7 +11,7 @@
 //! with `#[ignore]` and can be run via:
 //!     cargo test --test ffi_bindings -- --ignored
 
-use fluidaudio_rs::{EncoderPrecision, FluidAudio, FluidAudioError};
+use fluidaudio_rs::{EncoderPrecision, EouChunkSize, FluidAudio, FluidAudioError};
 
 /// The bridge can be created and dropped without panicking. Drop must not
 /// crash even if no `init_*` method was ever called.
@@ -185,6 +185,16 @@ fn nemotron_streaming_session_methods_error_before_init() {
     assert!(audio.nemotron_streaming_get_partial().is_err());
     assert!(audio.nemotron_streaming_finish().is_err());
     assert!(audio.nemotron_streaming_reset().is_err());
+}
+
+/// The end-of-utterance detector errors cleanly before `eou_init`.
+#[test]
+fn eou_methods_error_before_init() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    assert!(!audio.is_eou_available());
+    assert!(audio.eou_start().is_err());
+    assert!(audio.eou_feed(&[0.0_f32; 1600]).is_err());
+    assert!(audio.eou_finish().is_err());
 }
 
 /// VAD `process` methods must error before `init_vad` rather than crash.
@@ -669,6 +679,64 @@ fn empty_vocabulary_clears_without_loading_a_model() {
         .expect("blank vocabulary");
     audio.clear_vocabulary();
     assert!(audio.set_vocabulary(&["a\0b".to_string()]).is_err());
+}
+
+/// Index one past the last 10 ms frame of `samples` whose RMS reaches a
+/// quarter of the loudest frame's: where the speech ends. (jfk.wav's last
+/// word ends at 10.17 s; crowd noise rising to a tenth of the peak follows.)
+fn speech_end(samples: &[f32]) -> usize {
+    let rms: Vec<f32> = samples
+        .chunks(160)
+        .map(|frame| (frame.iter().map(|x| x * x).sum::<f32>() / frame.len() as f32).sqrt())
+        .collect();
+    let loudest = rms.iter().cloned().fold(0.0, f32::max);
+    let last = rms.iter().rposition(|&r| r >= loudest / 4.0).unwrap();
+    ((last + 1) * 160).min(samples.len())
+}
+
+/// Parakeet EOU (320 ms) reports the end of jfk's speech during the silence
+/// that follows it, never before the speech ends, and a new utterance starts
+/// clean.
+#[test]
+#[ignore = "downloads Parakeet EOU 120M (320 ms) and triggers ANE compilation"]
+fn eou_fires_after_the_speech_ends() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio.eou_init(EouChunkSize::Ms320).expect("EOU init");
+    assert!(audio.is_eou_available());
+
+    let mut samples = jfk_samples();
+    let end = speech_end(&samples);
+    samples.resize(samples.len() + 4 * 16_000, 0.0);
+
+    for run in 0..2 {
+        audio.eou_start().expect("start");
+        let mut fed = 0;
+        let mut fired_at = None;
+        let mut partial = String::new();
+        for chunk in samples.chunks(1_600) {
+            let update = audio.eou_feed(chunk).expect("feed");
+            fed += chunk.len();
+            partial = update.partial_text;
+            if update.end_of_utterance && fired_at.is_none() {
+                fired_at = Some(fed);
+            }
+        }
+        let text = audio.eou_finish().expect("finish");
+        let fired = fired_at.expect("end of utterance never fired");
+        println!(
+            "run {run}: speech ends at {} ms, end of utterance reported after {} ms of audio \
+             ({} ms later)\n  partial: {partial:?}\n  final:   {text:?}",
+            end / 16,
+            fired / 16,
+            (fired - end) / 16
+        );
+        assert!(fired > end, "end of utterance reported before speech ended");
+        assert!(
+            text.to_lowercase()
+                .contains("ask not what your country can do for you"),
+            "unexpected transcript {text:?}"
+        );
+    }
 }
 
 // ---- Scratch-home tests ---------------------------------------------------

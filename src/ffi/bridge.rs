@@ -68,6 +68,28 @@ extern "C" {
     ) -> i32;
     fn fluidaudio_is_streaming_asr_available(bridge: *mut std::ffi::c_void) -> i32;
 
+    // Parakeet EOU (end-of-utterance detection)
+    fn fluidaudio_eou_init(
+        bridge: *mut std::ffi::c_void,
+        chunk_ms: u32,
+        out_error: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_eou_start(bridge: *mut std::ffi::c_void, out_error: *mut *mut i8) -> i32;
+    fn fluidaudio_eou_feed(
+        bridge: *mut std::ffi::c_void,
+        samples: *const f32,
+        count: u32,
+        out_partial_text: *mut *mut i8,
+        out_end_of_utterance: *mut u8,
+        out_error: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_eou_finish(
+        bridge: *mut std::ffi::c_void,
+        out_text: *mut *mut i8,
+        out_error: *mut *mut i8,
+    ) -> i32;
+    fn fluidaudio_is_eou_available(bridge: *mut std::ffi::c_void) -> i32;
+
     fn fluidaudio_initialize_nemotron_streaming(bridge: *mut std::ffi::c_void) -> i32;
     fn fluidaudio_nemotron_streaming_process(
         bridge: *mut std::ffi::c_void,
@@ -575,6 +597,53 @@ impl FluidAudioBridge {
         unsafe { fluidaudio_is_streaming_asr_available(self.ptr) != 0 }
     }
 
+    pub fn eou_init(&self, chunk: EouChunkSize) -> Result<(), String> {
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
+        let status = unsafe { fluidaudio_eou_init(self.ptr, chunk.millis(), &mut error_ptr) };
+        check_status(status, error_ptr, "Failed to initialize Parakeet EOU")
+    }
+
+    pub fn eou_start(&self) -> Result<(), String> {
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
+        let status = unsafe { fluidaudio_eou_start(self.ptr, &mut error_ptr) };
+        check_status(status, error_ptr, "Failed to start an EOU utterance")
+    }
+
+    pub fn eou_feed(&self, samples: &[f32]) -> Result<EouUpdate, String> {
+        let mut text_ptr: *mut i8 = std::ptr::null_mut();
+        let mut end_of_utterance: u8 = 0;
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
+        let status = unsafe {
+            fluidaudio_eou_feed(
+                self.ptr,
+                samples.as_ptr(),
+                samples.len() as u32,
+                &mut text_ptr,
+                &mut end_of_utterance,
+                &mut error_ptr,
+            )
+        };
+        let partial_text = Self::take_string(text_ptr);
+        check_status(status, error_ptr, "Failed to feed Parakeet EOU")?;
+        Ok(EouUpdate {
+            partial_text,
+            end_of_utterance: end_of_utterance != 0,
+        })
+    }
+
+    pub fn eou_finish(&self) -> Result<String, String> {
+        let mut text_ptr: *mut i8 = std::ptr::null_mut();
+        let mut error_ptr: *mut i8 = std::ptr::null_mut();
+        let status = unsafe { fluidaudio_eou_finish(self.ptr, &mut text_ptr, &mut error_ptr) };
+        let text = Self::take_string(text_ptr);
+        check_status(status, error_ptr, "Failed to finish the EOU utterance")?;
+        Ok(text)
+    }
+
+    pub fn is_eou_available(&self) -> bool {
+        unsafe { fluidaudio_is_eou_available(self.ptr) != 0 }
+    }
+
     pub fn initialize_nemotron_streaming(&self) -> Result<(), String> {
         let result = unsafe { fluidaudio_initialize_nemotron_streaming(self.ptr) };
         if result == 0 {
@@ -989,6 +1058,40 @@ pub struct AsrResult {
     pub duration: f64,
     pub processing_time: f64,
     pub rtfx: f32,
+}
+
+/// Chunk size of the Parakeet EOU streaming encoder: how much new audio each
+/// decoding step consumes. Larger chunks are more accurate and add latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EouChunkSize {
+    /// 160 ms: lowest latency, 8.23% WER on LibriSpeech test-clean.
+    Ms160,
+    /// 320 ms: FluidAudio's balanced choice, 4.88% WER.
+    Ms320,
+    /// 1280 ms: highest throughput.
+    Ms1280,
+}
+
+impl EouChunkSize {
+    /// The chunk length in milliseconds.
+    pub fn millis(self) -> u32 {
+        match self {
+            EouChunkSize::Ms160 => 160,
+            EouChunkSize::Ms320 => 320,
+            EouChunkSize::Ms1280 => 1280,
+        }
+    }
+}
+
+/// What [`FluidAudio::eou_feed`](crate::FluidAudio::eou_feed) reports after
+/// each chunk of audio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EouUpdate {
+    /// The utterance's transcript so far.
+    pub partial_text: String,
+    /// Whether the end of the utterance has been detected. Once `true` it
+    /// stays `true` until [`FluidAudio::eou_start`](crate::FluidAudio::eou_start).
+    pub end_of_utterance: bool,
 }
 
 /// Weight precision of a loaded Parakeet Unified encoder.

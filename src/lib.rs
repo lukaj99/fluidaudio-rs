@@ -39,7 +39,9 @@ use std::path::Path;
 use thiserror::Error;
 
 // Re-export FFI types
-pub use ffi::{AsrResult, DiarizationSegment, EncoderPrecision, SystemInfo, VadFrame};
+pub use ffi::{
+    AsrResult, DiarizationSegment, EncoderPrecision, EouChunkSize, EouUpdate, SystemInfo, VadFrame,
+};
 
 /// Errors that can occur when using FluidAudio
 #[derive(Error, Debug)]
@@ -350,6 +352,53 @@ impl FluidAudio {
     /// [`init_streaming_asr`](Self::init_streaming_asr) succeeds.
     pub fn streaming_asr_encoder_precision(&self) -> Option<EncoderPrecision> {
         self.bridge.streaming_asr_encoder_precision()
+    }
+
+    // ========== End-of-Utterance Detection (Parakeet EOU) ==========
+
+    /// Load Parakeet EOU 120M, a small streaming model that transcribes and
+    /// detects the end of an utterance, with a `chunk`-sized encoder.
+    ///
+    /// The first run per chunk size downloads its model set (~220 MB at
+    /// 320 ms, pinned to a fixed Hugging Face revision) into
+    /// `~/Library/Application Support/FluidAudio/Models/parakeet-eou-streaming/<chunk>ms`.
+    /// [`EouChunkSize::Ms320`] is FluidAudio's balanced choice (4.88% WER on
+    /// LibriSpeech test-clean, against 8.23% at 160 ms). Blocks until loaded;
+    /// calling it again replaces the loaded model.
+    ///
+    /// The end of an utterance is confirmed once the model's end-of-utterance
+    /// token has been followed by 1.28 s of audio with no new words
+    /// (FluidAudio's default debounce). The model emits that token only after
+    /// some silence, and decodes a chunk at a time, so the end is reported
+    /// later still: on jfk.wav at 320 ms, 3.0 s after the last word.
+    pub fn eou_init(&self, chunk: EouChunkSize) -> Result<(), FluidAudioError> {
+        self.bridge.eou_init(chunk).map_err(FluidAudioError::from)
+    }
+
+    /// Start a new utterance, discarding the previous one's audio,
+    /// transcript and end-of-utterance state.
+    pub fn eou_start(&self) -> Result<(), FluidAudioError> {
+        self.bridge.eou_start().map_err(FluidAudioError::from)
+    }
+
+    /// Feed 16 kHz mono samples (normalized to -1.0..1.0) to the utterance.
+    ///
+    /// The model decodes whenever a full chunk is buffered, so a short feed
+    /// may change nothing. Returns the transcript so far and whether the end
+    /// of the utterance has been detected.
+    pub fn eou_feed(&self, samples: &[f32]) -> Result<EouUpdate, FluidAudioError> {
+        self.bridge.eou_feed(samples).map_err(FluidAudioError::from)
+    }
+
+    /// Flush the buffered audio and return the utterance's final transcript.
+    /// The detector is reset afterwards.
+    pub fn eou_finish(&self) -> Result<String, FluidAudioError> {
+        self.bridge.eou_finish().map_err(FluidAudioError::from)
+    }
+
+    /// Check if the Parakeet EOU model is loaded.
+    pub fn is_eou_available(&self) -> bool {
+        self.bridge.is_eou_available()
     }
 
     // ========== Nemotron Streaming ASR Methods ==========

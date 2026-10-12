@@ -56,6 +56,13 @@ class FluidAudioBridgeInternal {
     private let vocabularyLoadLock = NSLock()
     private var ctcModels: CtcModels?
 
+    // Parakeet EOU end-of-utterance detection, published like the preview
+    // engine: under a lock, once loaded. Loads queue process-wide, since all
+    // bridges download into the same folder.
+    private let eouLock = NSLock()
+    private var eouManager: StreamingEouAsrManager?
+    private static let eouLoadLock = NSLock()
+
     /// Base directory for the live-preview (streaming) engine:
     /// `~/Library/Application Support/FluidAudio/Models/parakeet-unified-preview`,
     /// so its files land in `parakeet-unified-preview/parakeet-unified-en-0.6b`
@@ -98,11 +105,16 @@ class FluidAudioBridgeInternal {
     private static let ctcWeightsRepo = "FluidInference/parakeet-ctc-110m-coreml"
     private static let ctcWeightsRevision = "accdafd8cf8a2ff1cabe3c11e54416b405d409aa"
 
+    /// Hugging Face commit of the Parakeet EOU 120M weights (all chunk sizes).
+    private static let eouWeightsRepo = "FluidInference/parakeet-realtime-eou-120m-coreml"
+    private static let eouWeightsRevision = "40a23f4c0b333aa17ad8c0f2ea47ec2347f2f355"
+
     /// Registers the pins once per process. `revisionOverrides` is process-wide,
     /// so this merges keys instead of replacing the dictionary.
     private static let pinUnifiedWeights: Void = {
         ModelRegistry.revisionOverrides[unifiedWeightsRepo] = unifiedWeightsRevision
         ModelRegistry.revisionOverrides[ctcWeightsRepo] = ctcWeightsRevision
+        ModelRegistry.revisionOverrides[eouWeightsRepo] = eouWeightsRevision
     }()
 
     init() {
@@ -917,6 +929,87 @@ class FluidAudioBridgeInternal {
         return buffer
     }
 
+    // MARK: - Parakeet EOU
+
+    /// Load Parakeet EOU 120M, a small streaming RNNT that also predicts
+    /// end of utterance, with a `chunkMs` (160, 320 or 1280) encoder.
+    ///
+    /// The first call per chunk size downloads its set (~220 MB at 320 ms)
+    /// into `Application Support/FluidAudio/Models/parakeet-eou-streaming/<chunk>ms`.
+    /// FluidAudio confirms an end of utterance once the model's
+    /// end-of-utterance token has been followed by `eouDebounceMs` (1280 ms,
+    /// FluidAudio's default) of audio with no new words.
+    func initializeEou(chunkMs: Int) throws {
+        let chunkSize: StreamingChunkSize
+        switch chunkMs {
+        case 160: chunkSize = .ms160
+        case 320: chunkSize = .ms320
+        case 1280: chunkSize = .ms1280
+        default: throw BridgeError.invalidArgument("EOU chunk size must be 160, 320 or 1280 ms, got \(chunkMs)")
+        }
+
+        Self.eouLoadLock.lock()
+        defer { Self.eouLoadLock.unlock() }
+        let manager = StreamingEouAsrManager(chunkSize: chunkSize)
+        try Self.blocking {
+            try await manager.loadModels(to: MLModelConfigurationUtils.defaultModelsDirectory())
+        }
+
+        eouLock.lock()
+        eouManager = manager
+        eouLock.unlock()
+    }
+
+    /// Begin a new utterance: clears the audio, transcript, encoder caches
+    /// and end-of-utterance state. The model stays loaded.
+    func eouStart() throws {
+        let manager = try loadedEouManager()
+        try Self.blocking { await manager.reset() }
+    }
+
+    /// Feed 16 kHz mono audio. Returns the utterance's transcript so far and
+    /// whether its end has been detected; once detected, that stays true
+    /// until `eouStart()`.
+    func eouFeed(_ samples: [Float]) throws -> (String, Bool) {
+        let manager = try loadedEouManager()
+        return try Self.blocking {
+            if !samples.isEmpty {
+                _ = try await manager.process(audioBuffer: Self.monoBuffer(samples))
+            }
+            return (await manager.getPartialTranscript(), await manager.eouDetected)
+        }
+    }
+
+    /// Flush buffered audio and return the utterance's final transcript.
+    /// Resets afterwards, so the next utterance starts clean.
+    func eouFinish() throws -> String {
+        let manager = try loadedEouManager()
+        return try Self.blocking {
+            let text: Result<String, Error>
+            do {
+                text = .success(try await manager.finish())
+            } catch {
+                text = .failure(error)
+            }
+            // Reset even after a failed finish, as streamingAsrFinish does.
+            await manager.reset()
+            return try text.get()
+        }
+    }
+
+    func isEouAvailable() -> Bool {
+        eouLock.lock()
+        defer { eouLock.unlock() }
+        return eouManager != nil
+    }
+
+    private func loadedEouManager() throws -> StreamingEouAsrManager {
+        eouLock.lock()
+        defer { eouLock.unlock() }
+        guard let manager = eouManager else { throw BridgeError.notInitialized }
+        return manager
+    }
+
     // MARK: - Nemotron Streaming ASR
 
     /// Load the Nemotron Speech Streaming 0.6B pipeline.
@@ -1205,6 +1298,9 @@ class FluidAudioBridgeInternal {
         lastStreamingPartial = ""
         streamingAsrLock.unlock()
         nemotronStreamingManager = nil
+        eouLock.lock()
+        eouManager = nil
+        eouLock.unlock()
         kokoroManager = nil
     }
 }
@@ -1212,6 +1308,7 @@ class FluidAudioBridgeInternal {
 enum BridgeError: Error {
     case notInitialized
     case noResult
+    case invalidArgument(String)
 }
 
 // MARK: - C FFI Functions
@@ -1505,6 +1602,88 @@ public func fluidaudio_is_streaming_asr_available(_ ptr: UnsafeMutableRawPointer
     guard let ptr = ptr else { return 0 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
     return bridge.isStreamingAsrAvailable() ? 1 : 0
+}
+
+// MARK: - Parakeet EOU FFI
+
+/// Load Parakeet EOU with a 160, 320 or 1280 ms chunk. On failure returns -1
+/// and sets `outError`.
+@_cdecl("fluidaudio_eou_init")
+public func fluidaudio_eou_init(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ chunkMs: UInt32,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        try bridge.initializeEou(chunkMs: Int(chunkMs))
+        return 0
+    } catch {
+        return reportFailure(error, outError)
+    }
+}
+
+@_cdecl("fluidaudio_eou_start")
+public func fluidaudio_eou_start(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        try bridge.eouStart()
+        return 0
+    } catch {
+        return reportFailure(error, outError)
+    }
+}
+
+/// Feed samples; `outPartialText` gets the transcript so far (free with
+/// `fluidaudio_free_string`) and `outEndOfUtterance` 1 once the end of the
+/// utterance has been detected.
+@_cdecl("fluidaudio_eou_feed")
+public func fluidaudio_eou_feed(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ samples: UnsafePointer<Float>?,
+    _ count: UInt32,
+    _ outPartialText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    _ outEndOfUtterance: UnsafeMutablePointer<UInt8>?,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr, let samples = samples else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        let (partial, ended) = try bridge.eouFeed(Array(UnsafeBufferPointer(start: samples, count: Int(count))))
+        outPartialText?.pointee = strdup(partial)
+        outEndOfUtterance?.pointee = ended ? 1 : 0
+        return 0
+    } catch {
+        return reportFailure(error, outError)
+    }
+}
+
+@_cdecl("fluidaudio_eou_finish")
+public func fluidaudio_eou_finish(
+    _ ptr: UnsafeMutableRawPointer?,
+    _ outText: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
+    _ outError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Int32 {
+    guard let ptr = ptr else { return -1 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    do {
+        outText?.pointee = strdup(try bridge.eouFinish())
+        return 0
+    } catch {
+        return reportFailure(error, outError)
+    }
+}
+
+@_cdecl("fluidaudio_is_eou_available")
+public func fluidaudio_is_eou_available(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return 0 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    return bridge.isEouAvailable() ? 1 : 0
 }
 
 // MARK: - Nemotron Streaming FFI
