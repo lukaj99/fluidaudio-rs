@@ -236,6 +236,83 @@ fn itn_is_native_available_returns_bool() {
     let _ = audio.itn_is_native_available();
 }
 
+/// The NeMo ITN engine (text-processing-rs) loads from its dylib next to the
+/// test binary, so ITN rewrites spoken forms instead of passing text through.
+#[test]
+fn itn_runs_the_native_nemo_engine() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    assert!(audio.itn_is_native_available());
+    assert_eq!(
+        audio.itn_normalize("two hundred thirty two").unwrap(),
+        "232"
+    );
+}
+
+/// Without the engine dylib, ITN reports itself unavailable and returns text
+/// unchanged instead of failing. The check runs in a child process, since the
+/// dylib is looked up once per process.
+#[test]
+fn itn_without_the_engine_dylib_passes_text_through() {
+    const NAME: &str = "itn_without_the_engine_dylib_passes_text_through";
+    if std::env::var(SCRATCH_CHILD).as_deref() == Ok(NAME) {
+        let audio = FluidAudio::new().expect("bridge creation");
+        assert!(!audio.itn_is_native_available());
+        assert_eq!(
+            audio.itn_normalize_sentence("two hundred").unwrap(),
+            "two hundred"
+        );
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(SCRATCH_CHILD, NAME)
+        .env(
+            "FLUIDAUDIO_NEMO_ITN_DYLIB",
+            "/nonexistent/libfluidaudio_nemo_itn.dylib",
+        )
+        .output()
+        .expect("spawn child test");
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && log.contains("1 passed"), "{log}");
+}
+
+/// Sentence-mode ITN on dictation-style phrases. Each case prints its output.
+///
+/// Known engine limitations (text-processing-rs 0.3.1), left unasserted:
+/// "two milligrams" becomes "2 milligrams", not "2 mg"; a sentence-initial
+/// "first," becomes "1st,"; and "one hundred and twenty five milligrams"
+/// becomes "120 5 milligrams".
+#[test]
+#[ignore = "prints NeMo ITN outputs for review"]
+fn itn_normalizes_dictation_sentences() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    let cases = [
+        (
+            "give two milligrams of morphine",
+            "give 2 milligrams of morphine",
+        ),
+        ("january fifth twenty twenty five", "january 5 2025"),
+        ("the fifth of january twenty twenty five", "5 january 2025"),
+        ("review at two thirty p m", "review at 02:30 p.m."),
+        (
+            "the first dose was given at ten thirty a m on march third",
+            "the 1st dose was given at 10:30 a.m. on march 3",
+        ),
+        ("five dollars and fifty cents", "$5.50"),
+        ("ninety eight point six degrees", "98.6 degrees"),
+        ("the period ended", "the period ended"),
+    ];
+    let mut failures = Vec::new();
+    for (spoken, written) in cases {
+        let got = audio.itn_normalize_sentence(spoken).expect("ITN");
+        println!("{spoken:?} -> {got:?}");
+        if got != written {
+            failures.push(format!("{spoken:?}: expected {written:?}, got {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 // ---------------------------------------------------------------------------
 // Heavier tests below: gated behind `--ignored` because they download models
 // from HuggingFace and warm up the Apple Neural Engine (cold start ~20s).

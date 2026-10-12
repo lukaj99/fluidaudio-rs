@@ -660,11 +660,15 @@ impl FluidAudio {
             .map_err(FluidAudioError::from)
     }
 
-    /// Whether the underlying native NeMo ITN library is loaded.
+    /// Whether the NeMo ITN engine (text-processing-rs) is loaded.
     ///
-    /// When `false`, the Swift-side normalizer falls back to its
-    /// Apple-NaturalLanguage-only path (still functional, but with reduced
-    /// coverage on long multi-token expressions).
+    /// The engine has its own Rust runtime, so it ships as a separate
+    /// `libfluidaudio_nemo_itn.dylib`, which the build places in
+    /// `target/<profile>/`. It is loaded on first use from
+    /// `$FLUIDAUDIO_NEMO_ITN_DYLIB` if set, else from the executable's
+    /// `../Frameworks/` (app bundles), its own directory, or its parent.
+    /// When it is not found this returns `false` and every ITN call returns
+    /// its input unchanged.
     pub fn itn_is_native_available(&self) -> bool {
         self.bridge.itn_is_native_available()
     }

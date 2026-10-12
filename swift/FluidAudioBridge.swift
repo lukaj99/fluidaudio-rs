@@ -3,6 +3,7 @@ import AVFoundation
 import CoreML
 import CryptoKit
 import FluidAudio
+import NemoITNLoader
 import Darwin
 
 // MARK: - Bridge Class
@@ -1131,8 +1132,11 @@ class FluidAudioBridgeInternal {
         return TextNormalizer.shared.normalizeSentence(input, maxSpanTokens: maxSpanTokens)
     }
 
+    /// Whether the NeMo engine dylib loaded. `TextNormalizer.isNativeAvailable`
+    /// is a compile-time `true` here, since the trait is on, whether or not
+    /// NemoITNLoader found the dylib.
     func itnIsNativeAvailable() -> Bool {
-        return TextNormalizer.shared.isNativeAvailable
+        return fluidaudio_nemo_itn_available() != 0
     }
 
     func cleanup() {
