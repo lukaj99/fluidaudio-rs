@@ -4,6 +4,7 @@
 
 use fluidaudio_rs::FluidAudio;
 use std::env;
+use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get audio file path from command line
@@ -24,8 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize ASR
     println!("Initializing ASR (this may take a moment on first run)...");
+    let start = Instant::now();
     audio.init_asr()?;
-    println!("ASR initialized!\n");
+    println!("ASR initialized in {:.2}s\n", start.elapsed().as_secs_f64());
 
     // Transcribe
     println!("Transcribing: {}", audio_path);

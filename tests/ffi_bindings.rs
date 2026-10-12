@@ -154,6 +154,18 @@ fn streaming_asr_session_methods_error_before_init() {
     assert!(audio.streaming_asr_finish().is_err());
 }
 
+/// Same for the transcription calls: they must fail cleanly before their
+/// engine is loaded. The fixture exists, so the file-based calls get past the
+/// Rust-side path check and reach the Swift side.
+#[test]
+fn asr_transcription_errors_before_init() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.wav");
+    assert!(audio.transcribe_samples(&[0.0_f32; 16_000]).is_err());
+    assert!(audio.transcribe_file(&fixture).is_err());
+    assert!(audio.transcribe_file_streaming(&fixture).is_err());
+}
+
 /// Same as above for the Nemotron streaming session methods. `reset` is
 /// included because the streaming feeder calls it on teardown, so it must fail
 /// cleanly on an uninitialized bridge rather than trapping.
@@ -260,10 +272,11 @@ fn vad_processes_silence_buffer() {
 }
 
 /// End-to-end ASR sanity check on a buffer of silence. We don't assert on the
-/// transcript content, only that the call returns successfully and the
-/// reported duration matches the input length.
+/// transcript content, only that the call returns successfully, the reported
+/// duration matches the input length, and confidence is on FluidAudio's TDT
+/// scale (0.1 for an empty transcript, otherwise within [0.1, 1.0]).
 #[test]
-#[ignore = "downloads Parakeet TDT v2 models (~465 MB) and triggers ANE compilation"]
+#[ignore = "downloads Parakeet Unified EN 0.6B (~614 MB) and triggers ANE compilation"]
 fn asr_transcribes_silence_buffer() {
     let audio = FluidAudio::new().expect("bridge creation");
     audio.init_asr().expect("ASR init");
@@ -273,15 +286,23 @@ fn asr_transcribes_silence_buffer() {
     let samples = vec![0.0_f32; 16_000 * 2];
     let result = audio.transcribe_samples(&samples).expect("transcribe");
     assert!(result.duration >= 1.9 && result.duration <= 2.1);
+    if result.text.trim().is_empty() {
+        assert_eq!(result.confidence, 0.1);
+    } else {
+        assert!(
+            (0.1..=1.0).contains(&result.confidence),
+            "confidence {}",
+            result.confidence
+        );
+    }
 }
 
-/// Regression test for the bug where `transcribe_file` / `transcribe_samples`
-/// carried decoder state across calls: the TDT decoder's LSTM hidden/cell
-/// tensors and `lastToken` were stored in the bridge between invocations,
-/// biasing the next call's predictor with the previous call's
-/// end-of-utterance state. In practice this collapsed the second and
-/// subsequent transcripts to a lone "." (the previous call's terminal
-/// punctuation).
+/// Regression test: consecutive one-shot calls must not share decoder state.
+/// The bridge once kept the TDT decoder's LSTM hidden/cell tensors and
+/// `lastToken` between calls, which biased the next call's predictor with the
+/// previous call's end-of-utterance state and collapsed later transcripts to a
+/// lone "." (the previous call's terminal punctuation). The Unified engine
+/// decodes every window from a fresh RNNT state; this keeps it that way.
 ///
 /// We transcribe a short shipped WAV fixture twice in a row and assert:
 ///
@@ -300,7 +321,7 @@ fn asr_transcribes_silence_buffer() {
 /// Apple's TTS output isn't subject to third-party licensing; regenerating
 /// it on any macOS host produces a comparable clip.
 #[test]
-#[ignore = "downloads Parakeet TDT v2 models (~465 MB) and triggers ANE compilation"]
+#[ignore = "downloads Parakeet Unified EN 0.6B (~614 MB) and triggers ANE compilation"]
 fn asr_transcribe_file_is_stateless_across_calls() {
     let audio = FluidAudio::new().expect("bridge creation");
     audio.init_asr().expect("ASR init");
@@ -325,6 +346,11 @@ fn asr_transcribe_file_is_stateless_across_calls() {
         "first transcript should reference the spoken phrase, got {:?}",
         first.text,
     );
+    assert!(
+        (0.1..=1.0).contains(&first.confidence),
+        "confidence {}",
+        first.confidence
+    );
 
     // The actual regression assertion.
     assert_eq!(
@@ -334,4 +360,79 @@ fn asr_transcribe_file_is_stateless_across_calls() {
          between calls.",
         first.text, second.text,
     );
+}
+
+/// Streaming sessions share one loaded engine. `is_streaming_asr_available`
+/// may be polled from another thread while the model loads; feeds return only
+/// new, non-empty partials; and a second session over the same audio yields
+/// the same final text, so no state carries over between sessions.
+#[test]
+#[ignore = "downloads the Parakeet Unified EN 0.6B streaming encoder (~592 MB) and triggers ANE compilation"]
+fn streaming_asr_sessions_share_one_engine() {
+    let audio = std::sync::Arc::new(FluidAudio::new().expect("bridge creation"));
+
+    let poller = {
+        let audio = std::sync::Arc::clone(&audio);
+        std::thread::spawn(move || {
+            while !audio.is_streaming_asr_available() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    };
+    audio.init_streaming_asr().expect("streaming ASR init");
+    poller.join().expect("poller thread");
+
+    // hello.wav lasts 1.9 s. Trailing silence lets the engine (which decodes
+    // once 2.08 s are buffered) emit a partial before finish.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.wav");
+    let mut samples = read_wav_samples(&fixture);
+    samples.resize(samples.len() + 24_000, 0.0);
+
+    let run_session = || {
+        audio.streaming_asr_start().expect("start");
+        let mut partials: Vec<String> = Vec::new();
+        for chunk in samples.chunks(1_600) {
+            if let Some(partial) = audio.streaming_asr_feed(chunk).expect("feed") {
+                assert!(!partial.is_empty());
+                assert_ne!(partials.last(), Some(&partial), "feed repeated a partial");
+                partials.push(partial);
+            }
+        }
+        (partials, audio.streaming_asr_finish().expect("finish"))
+    };
+
+    let (partials, first) = run_session();
+    let (_, second) = run_session();
+
+    assert!(
+        !partials.is_empty(),
+        "expected a live partial before finish"
+    );
+    let first_lower = first.to_lowercase();
+    assert!(
+        first_lower.contains("hello") || first_lower.contains("test"),
+        "final transcript should reference the spoken phrase, got {first:?}",
+    );
+    assert_eq!(
+        first, second,
+        "the second session must not carry state from the first"
+    );
+}
+
+/// 16-bit PCM samples from a 16kHz mono WAV, scaled to [-1, 1]. Walks the RIFF
+/// chunks to `data`: the fixture carries an `FLLR` padding chunk before it.
+fn read_wav_samples(path: &std::path::Path) -> Vec<f32> {
+    let bytes = std::fs::read(path).expect("read wav");
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if &bytes[pos..pos + 4] == b"data" {
+            return bytes[pos + 8..pos + 8 + size]
+                .chunks_exact(2)
+                .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
+                .collect();
+        }
+        pos += 8 + size + (size & 1);
+    }
+    panic!("no data chunk in {path:?}");
 }

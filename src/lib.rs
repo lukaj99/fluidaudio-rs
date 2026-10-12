@@ -5,7 +5,8 @@
 //!
 //! ## Features
 //!
-//! - **ASR (Automatic Speech Recognition)** - High-quality speech-to-text using Parakeet TDT models
+//! - **ASR (Automatic Speech Recognition)** - English speech-to-text with NVIDIA
+//!   Parakeet Unified EN 0.6B, one-shot or streaming with live partial transcripts
 //! - **VAD (Voice Activity Detection)** - Detect speech segments in audio
 //! - **Speaker Diarization** - Identify and label different speakers in audio
 //!
@@ -84,8 +85,11 @@ impl FluidAudio {
 
     /// Initialize the ASR (Automatic Speech Recognition) engine
     ///
-    /// This downloads and loads the ASR models. First run may take 20-30 seconds
-    /// as models are compiled for the Neural Engine.
+    /// Loads NVIDIA Parakeet Unified EN 0.6B (FastConformer-RNNT, English) for
+    /// one-shot transcription. The first run downloads the offline model set
+    /// (~614 MB) into `~/Library/Application Support/FluidAudio/Models/parakeet-unified-en-0.6b`,
+    /// pinned to a fixed Hugging Face revision, and compiles it for the Neural
+    /// Engine; later runs load from that cache. Blocks until loaded.
     pub fn init_asr(&self) -> Result<(), FluidAudioError> {
         self.bridge.initialize_asr().map_err(FluidAudioError::from)
     }
@@ -151,11 +155,15 @@ impl FluidAudio {
 
     // ========== Streaming ASR Methods ==========
 
-    /// Initialize Streaming ASR (memory-efficient, uses 99.5% less memory than regular ASR)
+    /// Initialize Streaming ASR for live partial transcripts
     ///
-    /// Streaming ASR is ideal for long audio files or real-time transcription where
-    /// memory usage is a concern. It processes audio in chunks rather than loading
-    /// the entire file into memory.
+    /// Loads the streaming Parakeet Unified EN 0.6B engine (2.08 s latency). The
+    /// first run downloads its streaming encoder (~592 MB) into the same folder
+    /// as [`init_asr`](Self::init_asr), whose decoder, joint and vocabulary it
+    /// shares. Blocks until loaded, so it can run on a background thread while
+    /// other threads transcribe one-shot or poll
+    /// [`is_streaming_asr_available`](Self::is_streaming_asr_available). Model
+    /// loads run one at a time, and a call after a successful load returns at once.
     ///
     /// # Example
     /// ```rust,no_run
@@ -193,7 +201,8 @@ impl FluidAudio {
     /// Start a streaming ASR session
     ///
     /// Call this before feeding audio chunks. Use `streaming_asr_feed()` to process
-    /// audio chunks, then `streaming_asr_finish()` to get the final result.
+    /// audio chunks, then `streaming_asr_finish()` to get the final result. Any
+    /// previous session's audio and text are discarded; the model stays loaded.
     pub fn streaming_asr_start(&self) -> Result<(), FluidAudioError> {
         self.bridge
             .streaming_asr_start()
@@ -209,13 +218,13 @@ impl FluidAudio {
     /// will process the audio incrementally.
     ///
     /// # Returns
-    /// * `Some(String)` — the current best hypothesis (confirmed prefix plus the
-    ///   volatile tail), suitable for a live preview
-    /// * `None` — the sliding window has not decoded anything new yet
+    /// * `Some(String)` — the session's transcript so far, suitable for a live
+    ///   preview; returned only when it differs from the previous `Some`
+    /// * `None` — nothing new has been decoded since then
     ///
-    /// The window decodes far less often than chunks arrive, so most calls
-    /// return `None`. Use [`streaming_asr_finish`](Self::streaming_asr_finish)
-    /// for the authoritative transcript.
+    /// The engine decodes once the first 2.08 s are buffered and then every
+    /// 1.04 s, so most calls return `None`. Use
+    /// [`streaming_asr_finish`](Self::streaming_asr_finish) for the final transcript.
     pub fn streaming_asr_feed(&self, samples: &[f32]) -> Result<Option<String>, FluidAudioError> {
         self.bridge
             .streaming_asr_feed(samples)
@@ -227,25 +236,26 @@ impl FluidAudio {
     /// # Returns
     /// * `String` containing the complete transcribed text
     ///
-    /// This finalizes processing and returns the full transcription. After calling
-    /// this, you must call `streaming_asr_start()` again to start a new session.
+    /// This flushes the buffered audio and returns the full transcription, then
+    /// clears the session. Call `streaming_asr_start()` again to start a new one.
     pub fn streaming_asr_finish(&self) -> Result<String, FluidAudioError> {
         self.bridge
             .streaming_asr_finish()
             .map_err(FluidAudioError::from)
     }
 
-    /// Transcribe an audio file using streaming ASR (memory-efficient wrapper)
+    /// Transcribe an audio file through the streaming engine
     ///
-    /// This is a convenience method that handles the session lifecycle for you.
-    /// For long files or when memory usage is critical, this uses significantly
-    /// less memory than `transcribe_file()`.
+    /// This is a convenience method that runs the whole file as one streaming
+    /// session. It shares the engine with the session API, so do not call it
+    /// while a session is open.
     ///
     /// # Arguments
     /// * `path` - Path to the audio file (WAV, M4A, MP3, etc.)
     ///
     /// # Returns
-    /// * `AsrResult` containing the transcribed text and metadata
+    /// * `AsrResult` containing the transcribed text and metadata; `confidence`
+    ///   is not computed on this path and is always 0.0
     ///
     /// # Example
     /// ```rust,no_run
@@ -278,6 +288,9 @@ impl FluidAudio {
     }
 
     /// Check if streaming ASR is initialized and ready
+    ///
+    /// Safe to poll from any thread, including while
+    /// [`init_streaming_asr`](Self::init_streaming_asr) is still loading.
     pub fn is_streaming_asr_available(&self) -> bool {
         self.bridge.is_streaming_asr_available()
     }

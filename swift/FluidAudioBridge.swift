@@ -17,12 +17,9 @@ struct BridgeDiarizationSegment {
 }
 
 class FluidAudioBridgeInternal {
-    private var asrManager: AsrManager?
-    private var asrModels: AsrModels?
-    private var asrDecoderState: TdtDecoderState?
+    private var asrManager: UnifiedAsrManager?
     private var vadManager: VadManager?
     private var diarizerManager: OfflineDiarizerManager?
-    private var streamingAsrManager: SlidingWindowAsrManager?
     private var nemotronStreamingManager: StreamingNemotronAsrManager?
     private var kokoroManager: KokoroAneManager?
     // Model-path diarization: retain the loaded MLModel (the ~4s-to-load part) keyed by
@@ -30,30 +27,49 @@ class FluidAudioBridgeInternal {
     // — the Rust bridge is Send+Sync and may be entered concurrently from multiple threads.
     private let sortformerCacheLock = NSLock()
     private var sortformerModelCache: [String: MLModel] = [:]
+    // Streaming ASR can still be loading on one thread while another polls
+    // `isStreamingAsrAvailable()`, so the manager is published under a lock, and
+    // only once it has loaded. The last partial handed out shares the lock.
+    private let streamingAsrLock = NSLock()
+    private var streamingAsrManager: StreamingUnifiedAsrManager?
+    private var lastStreamingPartial = ""
+    // Every Parakeet load, from any bridge in the process, downloads into the
+    // same `parakeet-unified-en-0.6b` folder; concurrent first-time downloads
+    // would write the same `.partial` files, so loads run one at a time.
+    private static let asrLoadLock = NSLock()
 
-    init() {}
+    /// Hugging Face commit of the Core ML Parakeet Unified weights both ASR
+    /// paths download. Unpinned, FluidAudio follows the repo's `main` branch.
+    private static let unifiedWeightsRepo = "FluidInference/parakeet-unified-en-0.6b-coreml"
+    private static let unifiedWeightsRevision = "d32e972dd4315f1dc3f6be28fb2aab0ab3e80358"
 
-    /// The Parakeet model both ASR paths load. FluidAudio's `downloadAndLoad`
-    /// still defaults to `.v3` (multilingual); VoiceFlow runs English-only v2.
-    private static let parakeetVersion: AsrModelVersion = .v2
+    /// Registers the pin once per process. `revisionOverrides` is process-wide,
+    /// so this merges one key instead of replacing the dictionary.
+    private static let pinUnifiedWeights: Void = {
+        ModelRegistry.revisionOverrides[unifiedWeightsRepo] = unifiedWeightsRevision
+    }()
 
+    init() {
+        // Before this bridge can start any download.
+        _ = Self.pinUnifiedWeights
+    }
+
+    /// Load NVIDIA Parakeet Unified EN 0.6B for one-shot transcription.
+    ///
+    /// The first call downloads the offline file set (~614 MB: int8 15 s
+    /// encoder, decoder, joint, vocab, metadata) into
+    /// `Application Support/FluidAudio/Models/parakeet-unified-en-0.6b`.
     func initializeAsr() throws {
+        Self.asrLoadLock.lock()
+        defer { Self.asrLoadLock.unlock() }
+
+        let manager = UnifiedAsrManager(encoderPrecision: .int8)
         let semaphore = DispatchSemaphore(value: 0)
         var initError: Error?
 
         Task {
             do {
-                let models = try await AsrModels.downloadAndLoad(version: Self.parakeetVersion)
-                self.asrModels = models
-
-                let manager = AsrManager()
-                try await manager.loadModels(models)
-                // Construct decoder state first so a throw here does not leave
-                // `asrManager` set while `asrDecoderState` is nil — that combo
-                // makes `isAsrAvailable()` return true but every transcribe call
-                // fail with `notInitialized`.
-                self.asrDecoderState = try TdtDecoderState()
-                self.asrManager = manager
+                try await manager.loadModels()
             } catch {
                 initError = error
             }
@@ -65,65 +81,37 @@ class FluidAudioBridgeInternal {
         if let error = initError {
             throw error
         }
+        asrManager = manager
     }
 
     func transcribeFile(_ path: String) throws -> (String, Float, Double, Double, Float) {
-        // One-shot transcription: each call starts with a fresh decoder state so
-        // results don't leak across utterances. The TDT decoder's LSTM hidden/cell
-        // state and `lastToken` would otherwise persist, biasing the next call's
-        // predictor (e.g. priming it with end-of-sentence punctuation, which
-        // collapses subsequent transcripts to ".").
-        // Streaming-style chunked decoding is exposed separately via the
-        // streaming ASR API (`streaming_asr_*`), which manages state explicitly.
-        guard let manager = asrManager else {
+        guard asrManager != nil else {
             throw BridgeError.notInitialized
         }
-        var decoderState = try TdtDecoderState()
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: ASRResult?
-        var transcribeError: Error?
-
-        Task {
-            do {
-                let url = URL(fileURLWithPath: path)
-                result = try await manager.transcribe(url, decoderState: &decoderState)
-            } catch {
-                transcribeError = error
-            }
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-
-        if let error = transcribeError {
-            throw error
-        }
-
-        guard let r = result else {
-            throw BridgeError.noResult
-        }
-
-        return (r.text, r.confidence, r.duration, r.processingTime, r.rtfx)
+        let samples = try AudioConverter().resampleAudioFile(path: path)
+        return try transcribeSamples(samples)
     }
 
     func transcribeSamples(_ samples: [Float]) throws -> (String, Float, Double, Double, Float) {
-        // See `transcribeFile` for the rationale: fresh decoder state per call.
+        // Nothing carries over between calls: the manager decodes every 15 s
+        // window from a fresh RNNT decoder state.
         guard let manager = asrManager else {
             throw BridgeError.notInitialized
         }
-        var decoderState = try TdtDecoderState()
 
         let semaphore = DispatchSemaphore(value: 0)
-        var result: ASRResult?
+        var result: UnifiedAsrManager.TranscriptionWithTimings?
         var transcribeError: Error?
+        var processingTime: Double = 0
 
         Task {
+            let start = DispatchTime.now()
             do {
-                result = try await manager.transcribe(samples, decoderState: &decoderState)
+                result = try await manager.transcribeWithTimings(samples)
             } catch {
                 transcribeError = error
             }
+            processingTime = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e9
             semaphore.signal()
         }
 
@@ -137,7 +125,25 @@ class FluidAudioBridgeInternal {
             throw BridgeError.noResult
         }
 
-        return (r.text, r.confidence, r.duration, r.processingTime, r.rtfx)
+        let duration = Double(samples.count) / 16000.0
+        let rtfx = processingTime > 0 ? Float(duration / processingTime) : 0
+        let confidence = Self.utteranceConfidence(text: r.text, tokenTimings: r.tokenTimings)
+        return (r.text, confidence, duration, processingTime, rtfx)
+    }
+
+    /// Utterance confidence on the scale of FluidAudio's TDT `ASRResult.confidence`
+    /// (`AsrManager.calculateConfidence`), which callers gate on: the mean
+    /// per-token softmax probability clamped to [0.1, 1.0], 0.1 for an empty
+    /// transcript, and 0.5 when text arrives without token scores.
+    private static func utteranceConfidence(text: String, tokenTimings: [TokenTiming]) -> Float {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return 0.1
+        }
+        guard !tokenTimings.isEmpty else {
+            return 0.5
+        }
+        let mean = tokenTimings.map(\.confidence).reduce(0, +) / Float(tokenTimings.count)
+        return max(0.1, min(1.0, mean))
     }
 
     func isAsrAvailable() -> Bool {
@@ -498,42 +504,30 @@ class FluidAudioBridgeInternal {
 
     // MARK: - Streaming ASR
 
-    /// Sliding-window settings for a *live preview* stream.
+    /// Load the streaming Parakeet Unified EN 0.6B engine for live preview.
     ///
-    /// `SlidingWindowAsrConfig.default` is `left + chunk + right` = 2 + 11 + 2 =
-    /// 15s (FluidAudio 0.15.3+), which fits the Parakeet encoder's fixed 15s
-    /// input, but a window only decodes once `chunk + right` = 13s of audio is
-    /// buffered — later than most dictations last.
+    /// One `StreamingUnifiedAsrManager` at FluidAudio's default [70, 13, 13]
+    /// encoder context (5.6 s left, 1.04 s chunk, 1.04 s right: 2.08 s latency)
+    /// serves every session. Its streaming encoder is a separate ~592 MB
+    /// download; the decoder, joint and vocab are shared with the one-shot set.
     ///
-    /// 4 + 2 + 0.5 = 6.5s decodes after 2.5s and then roughly every 2s.
-    /// `minContextForConfirmation: 0` promotes each window into
-    /// `confirmedTranscript` immediately. Since FluidAudio 0.15.7 an unconfirmed
-    /// window also appends to `volatileTranscript` instead of overwriting it, so
-    /// the preview accumulates either way.
-    ///
-    /// This affects the preview only — VoiceFlow's authoritative transcript
-    /// comes from a fresh one-shot decode of the full buffered audio.
-    private static let previewStreamingConfig = SlidingWindowAsrConfig(
-        chunkSeconds: 2.0,
-        hypothesisChunkSeconds: 1.0,
-        leftContextSeconds: 4.0,
-        rightContextSeconds: 0.5,
-        minContextForConfirmation: 0.0,
-        confirmationThreshold: 0.0
-    )
-
+    /// Blocks until the model is downloaded and loaded. Other threads may poll
+    /// `isStreamingAsrAvailable()` meanwhile; it turns true only once the
+    /// manager has loaded. Calling this again after a successful load is a no-op.
     func initializeStreamingAsr() throws {
+        Self.asrLoadLock.lock()
+        defer { Self.asrLoadLock.unlock() }
+        if isStreamingAsrAvailable() {
+            return
+        }
+
+        let manager = StreamingUnifiedAsrManager(encoderPrecision: .int8)
         let semaphore = DispatchSemaphore(value: 0)
         var initError: Error?
 
         Task {
             do {
-                let models = try await AsrModels.downloadAndLoad(version: Self.parakeetVersion)
-                self.asrModels = models
-
-                let manager = SlidingWindowAsrManager(config: Self.previewStreamingConfig)
-                try await manager.loadModels(models)
-                self.streamingAsrManager = manager
+                try await manager.loadModels()
             } catch {
                 initError = error
             }
@@ -545,36 +539,27 @@ class FluidAudioBridgeInternal {
         if let error = initError {
             throw error
         }
+
+        streamingAsrLock.lock()
+        streamingAsrManager = manager
+        streamingAsrLock.unlock()
     }
 
-    /// Begin a streaming session, replacing the previous manager instance.
+    /// Begin a streaming session on the loaded manager.
     ///
-    /// `SlidingWindowAsrManager` is single-use: its input `AsyncStream` is built
-    /// once in `init` and permanently terminated by `finish()`/`cancel()`, and
-    /// neither `startStreaming()` nor `finish()` clears `confirmedTranscript` /
-    /// `volatileTranscript`. Reusing one instance for a second session therefore
-    /// silently drops every fed buffer *and* keeps replaying the previous
-    /// session's transcript as the live hypothesis. Build a fresh manager per
-    /// session instead — `loadModels(_:)` on already-loaded `AsrModels` is just
-    /// pointer assignment, so this costs nothing.
+    /// `reset()` clears the previous session's audio, decoder state and
+    /// transcript; the model stays loaded.
     func streamingAsrStart() throws {
-        guard streamingAsrManager != nil, let models = asrModels else {
+        guard let manager = loadedStreamingAsrManager() else {
             throw BridgeError.notInitialized
         }
-        let previous = streamingAsrManager
 
         let semaphore = DispatchSemaphore(value: 0)
         var startError: Error?
 
         Task {
-            // Tear down the prior session's recognition task if it was
-            // abandoned without a finish() (cancel is idempotent after one).
-            await previous?.cancel()
             do {
-                let manager = SlidingWindowAsrManager(config: Self.previewStreamingConfig)
-                try await manager.loadModels(models)
-                try await manager.startStreaming(source: .microphone)
-                self.streamingAsrManager = manager
+                try await manager.reset()
             } catch {
                 startError = error
             }
@@ -582,64 +567,65 @@ class FluidAudioBridgeInternal {
         }
 
         semaphore.wait()
+        clearLastStreamingPartial()
 
         if let error = startError {
             throw error
         }
     }
 
-    /// Feed a chunk of 16kHz mono audio and return the current best hypothesis.
+    /// Feed a chunk of 16kHz mono audio and return the hypothesis if it changed.
     ///
-    /// Returns `nil` when the window has not decoded anything yet — the sliding
-    /// window decodes far less often than chunks arrive, so most feeds produce
-    /// no new text. Callers use this for a live preview only; `streamingAsrFinish()`
-    /// remains the authoritative transcript.
+    /// The engine decodes once the first 2.08 s are buffered and then every
+    /// 1.04 s, so most feeds add no text: `nil` means nothing new since the
+    /// last returned partial. Callers use this for a live preview only;
+    /// `streamingAsrFinish()` returns the session's final transcript.
     func streamingAsrFeed(_ samples: [Float]) throws -> String? {
-        guard let manager = streamingAsrManager else {
+        guard let manager = loadedStreamingAsrManager() else {
             throw BridgeError.notInitialized
         }
 
         let semaphore = DispatchSemaphore(value: 0)
-        var partial: String?
+        var partial = ""
+        var feedError: Error?
 
         Task {
-            // Convert samples to AVAudioPCMBuffer
-            let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: UInt32(samples.count))!
-            buffer.frameLength = UInt32(samples.count)
-
-            let channelData = buffer.floatChannelData![0]
-            for (i, sample) in samples.enumerated() {
-                channelData[i] = sample
+            do {
+                if !samples.isEmpty {
+                    try await manager.appendAudio(Self.monoBuffer(samples))
+                }
+                try await manager.processBufferedAudio()
+                partial = await manager.getPartialTranscript()
+            } catch {
+                feedError = error
             }
-
-            await manager.streamAudio(buffer)
-
-            // Confirmed text plus the still-volatile tail is the best current
-            // hypothesis. Concatenated in that order — `confirmedTranscript`
-            // is the settled prefix. Space-joined (matching the manager's own
-            // `finish()`); plain `+` welds the halves into "world.This is".
-            let confirmed = await manager.confirmedTranscript
-            let volatileTail = await manager.volatileTranscript
-            let parts = [confirmed, volatileTail].filter { !$0.isEmpty }
-            let combined = parts.joined(separator: " ").trimmingCharacters(in: .whitespaces)
-            partial = combined.isEmpty ? nil : combined
-
             semaphore.signal()
         }
 
         semaphore.wait()
 
+        if let error = feedError {
+            throw error
+        }
+
+        streamingAsrLock.lock()
+        defer { streamingAsrLock.unlock() }
+        guard !partial.isEmpty, partial != lastStreamingPartial else {
+            return nil
+        }
+        lastStreamingPartial = partial
         return partial
     }
 
+    /// Flush the session and return its final transcript. The manager is reset
+    /// afterwards, so the next `streamingAsrStart()` begins clean.
     func streamingAsrFinish() throws -> String {
-        guard let manager = streamingAsrManager else {
+        guard let manager = loadedStreamingAsrManager() else {
             throw BridgeError.notInitialized
         }
 
         let semaphore = DispatchSemaphore(value: 0)
-        var result: String?
+        var result = ""
         var finishError: Error?
 
         Task {
@@ -648,54 +634,48 @@ class FluidAudioBridgeInternal {
             } catch {
                 finishError = error
             }
+            // Reset even after a failed finish. A failing reset is not lost:
+            // streamingAsrStart() resets again and reports it.
+            try? await manager.reset()
             semaphore.signal()
         }
 
         semaphore.wait()
+        clearLastStreamingPartial()
 
         if let error = finishError {
             throw error
         }
 
-        return result ?? ""
+        return result
     }
 
+    /// Transcribe a whole file as one streaming session. It shares the manager
+    /// with the session API, so it must not run while a session is open.
     func transcribeFileStreaming(_ path: String) throws -> (String, Float, Double, Double, Float) {
-        guard let manager = streamingAsrManager else {
+        guard let manager = loadedStreamingAsrManager() else {
             throw BridgeError.notInitialized
         }
+        let samples = try AudioConverter().resampleAudioFile(path: path)
 
         let semaphore = DispatchSemaphore(value: 0)
-        var text: String?
+        var text = ""
         var transcribeError: Error?
-        var duration: Double = 0.0
-        var processingTime: Double = 0.0
+        var processingTime: Double = 0
 
         Task {
+            let start = DispatchTime.now()
             do {
-                let url = URL(fileURLWithPath: path)
-
-                let startTime = Date()
-                try await manager.startStreaming(source: .microphone)
-
-                // Load and stream audio file
-                let audioFile = try AVAudioFile(forReading: url)
-                let format = audioFile.processingFormat
-                duration = Double(audioFile.length) / format.sampleRate
-
-                let frameCount = AVAudioFrameCount(4096)
-                let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
-
-                while audioFile.framePosition < audioFile.length {
-                    try audioFile.read(into: buffer)
-                    await manager.streamAudio(buffer)
+                try await manager.reset()
+                if !samples.isEmpty {
+                    try await manager.appendAudio(Self.monoBuffer(samples))
                 }
-
                 text = try await manager.finish()
-                processingTime = Date().timeIntervalSince(startTime)
             } catch {
                 transcribeError = error
             }
+            processingTime = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e9
+            try? await manager.reset()
             semaphore.signal()
         }
 
@@ -705,12 +685,36 @@ class FluidAudioBridgeInternal {
             throw error
         }
 
-        let rtfx = duration > 0 ? Float(duration / processingTime) : 0.0
-        return (text ?? "", 0.0, duration, processingTime, rtfx)
+        let duration = Double(samples.count) / 16000.0
+        let rtfx = processingTime > 0 ? Float(duration / processingTime) : 0
+        return (text, 0.0, duration, processingTime, rtfx)
     }
 
     func isStreamingAsrAvailable() -> Bool {
-        return streamingAsrManager != nil
+        return loadedStreamingAsrManager() != nil
+    }
+
+    private func loadedStreamingAsrManager() -> StreamingUnifiedAsrManager? {
+        streamingAsrLock.lock()
+        defer { streamingAsrLock.unlock() }
+        return streamingAsrManager
+    }
+
+    private func clearLastStreamingPartial() {
+        streamingAsrLock.lock()
+        lastStreamingPartial = ""
+        streamingAsrLock.unlock()
+    }
+
+    /// Wrap 16kHz mono samples in the Float32 buffer FluidAudio's streaming API takes.
+    private static func monoBuffer(_ samples: [Float]) -> AVAudioPCMBuffer {
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count))!
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { src in
+            buffer.floatChannelData![0].update(from: src.baseAddress!, count: samples.count)
+        }
+        return buffer
     }
 
     // MARK: - Nemotron Streaming ASR
@@ -950,14 +954,15 @@ class FluidAudioBridgeInternal {
 
     func cleanup() {
         asrManager = nil
-        asrModels = nil
-        asrDecoderState = nil
         vadManager = nil
         diarizerManager = nil
         sortformerCacheLock.lock()
         sortformerModelCache.removeAll()
         sortformerCacheLock.unlock()
+        streamingAsrLock.lock()
         streamingAsrManager = nil
+        lastStreamingPartial = ""
+        streamingAsrLock.unlock()
         nemotronStreamingManager = nil
         kokoroManager = nil
     }

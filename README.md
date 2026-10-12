@@ -5,10 +5,11 @@ Rust bindings for [FluidAudio](https://github.com/FluidInference/FluidAudio) - a
 ## Features
 
 - **ASR (Automatic Speech Recognition)**
-  - **Parakeet TDT** - High-quality speech-to-text for 25 European languages
-    - Regular ASR for maximum accuracy
-    - Streaming ASR for 99.5% less memory usage
-    - Real-time sample transcription
+  - **Parakeet Unified EN 0.6B** - NVIDIA's English speech-to-text model
+    ([`nvidia/parakeet-unified-en-0.6b`](https://huggingface.co/nvidia/parakeet-unified-en-0.6b),
+    FastConformer encoder with an RNN-T decoder; punctuation and capitalisation)
+    - One-shot transcription of files and raw samples
+    - Streaming sessions with live partial transcripts (2.08 s latency)
 - **VAD (Voice Activity Detection)** - Detect speech segments in audio
 - **Speaker Diarization** - Identify and label different speakers in audio
 
@@ -81,33 +82,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 This is ideal for meeting transcription apps, voice assistants, and other real-time scenarios where writing to temporary files adds unnecessary overhead.
 
-### Streaming ASR (Memory-Efficient)
+### Streaming ASR (Live Partials)
 
-Streaming ASR uses **99.5% less memory** than regular ASR by processing audio in chunks rather than loading entire files. Perfect for long recordings or resource-constrained environments.
-
-#### Simple File Wrapper
-
-The easiest way to use streaming ASR - just like regular transcription but memory-efficient:
-
-```rust
-use fluidaudio_rs::FluidAudio;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let audio = FluidAudio::new()?;
-    audio.init_streaming_asr()?;
-
-    // Process large files with minimal memory
-    let result = audio.transcribe_file_streaming("long_meeting.wav")?;
-    println!("Text: {}", result.text);
-    println!("Speed: {:.1}x realtime", result.rtfx);
-
-    Ok(())
-}
-```
+Streaming ASR runs the streaming export of Parakeet Unified EN 0.6B: each step
+re-encodes 5.6 s of left context, a 1.04 s chunk and 1.04 s of look-ahead. A
+step runs once 2.08 s of audio is buffered and then every 1.04 s, so a word
+reaches the partial transcript about 2.08 s after it is spoken.
+`init_streaming_asr` downloads the streaming encoder (~592 MB) on first use;
+the rest of the model is shared with `init_asr`.
 
 #### Session-Based API
 
-For real-time streaming with full control:
+For real-time streaming with live partials:
 
 ```rust
 use fluidaudio_rs::FluidAudio;
@@ -116,13 +102,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio = FluidAudio::new()?;
     audio.init_streaming_asr()?;
 
-    // Start streaming session
+    // Start streaming session (clears any previous one; the model stays loaded)
     audio.streaming_asr_start()?;
 
-    // Feed audio chunks as they arrive
+    // Feed audio chunks as they arrive (16kHz mono)
     loop {
         let samples: Vec<f32> = capture_audio_chunk(); // From mic, network, etc.
-        audio.streaming_asr_feed(&samples)?;
+        if let Some(partial) = audio.streaming_asr_feed(&samples)? {
+            println!("Partial: {}", partial); // only when the text changed
+        }
 
         if done {
             break;
@@ -137,16 +125,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`init_streaming_asr` blocks until the model is loaded, so it can run on a
+background thread while other threads transcribe one-shot or poll
+`is_streaming_asr_available()`.
+
+#### Simple File Wrapper
+
+Runs a whole file through the streaming engine as one session (no confidence
+score on this path):
+
+```rust
+use fluidaudio_rs::FluidAudio;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let audio = FluidAudio::new()?;
+    audio.init_streaming_asr()?;
+
+    let result = audio.transcribe_file_streaming("meeting.wav")?;
+    println!("Text: {}", result.text);
+    println!("Speed: {:.1}x realtime", result.rtfx);
+
+    Ok(())
+}
+```
+
 **When to use Streaming ASR:**
-- Long audio files (> 5 minutes)
-- Real-time transcription with live audio feed
-- Memory-constrained environments
-- Continuous streaming scenarios
+- Live captions or dictation previews while audio is still arriving
 
 **When to use Regular ASR:**
-- Short audio clips (< 5 minutes)
-- When you need maximum accuracy on complete audio
-- Batch processing where memory isn't a concern
+- Complete utterances, recordings and files: the full-attention offline encoder
+  sees each 15 s window at once and is the more accurate export in FluidAudio's
+  LibriSpeech test-clean runs
 
 ### Voice Activity Detection (VAD)
 
@@ -192,7 +201,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Model Loading
 
-First initialization downloads and compiles ML models (~500MB total). This can take 20-30 seconds as Apple's Neural Engine compiles the models. Subsequent loads use cached compilations (~1 second).
+Models download from Hugging Face on first use into
+`~/Library/Application Support/FluidAudio/Models/`. Parakeet Unified EN 0.6B
+comes from [`FluidInference/parakeet-unified-en-0.6b-coreml`](https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml),
+pinned to commit `d32e972dd4315f1dc3f6be28fb2aab0ab3e80358` so new uploads
+cannot change what an existing build loads, into the `parakeet-unified-en-0.6b`
+folder:
+
+| Call | Downloads |
+|------|-----------|
+| `init_asr` | int8 offline encoder, decoder, joint, `vocab.json`, `metadata.json` (~614 MB) |
+| `init_streaming_asr` | int8 streaming encoder (~592 MB), plus the shared decoder, joint and vocab files if `init_asr` has not fetched them |
+
+On an M5 Pro (macOS 27.2) the first load after the download compiles the
+models for the Neural Engine: about 8.5 s for `init_asr` and 6.5 s for
+`init_streaming_asr`. Later loads by the same executable take about 0.1 s.
+The compiled cache is tied to the executable: a new or relocated binary
+compiled again in our measurements even with the model files cached.
 
 ## Platform Support
 
@@ -214,4 +239,10 @@ This crate uses a C FFI bridge to communicate between Rust and Swift:
 
 ## License
 
-MIT
+This crate is MIT. [FluidAudio](https://github.com/FluidInference/FluidAudio) is
+Apache-2.0. Model weights carry their own licences: Parakeet Unified EN 0.6B is
+released by NVIDIA under the
+[NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/),
+which requires anyone who redistributes the model to include a copy of the
+Agreement and a Notice ("Licensed by NVIDIA Corporation under the NVIDIA Open
+Model License").

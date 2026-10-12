@@ -932,6 +932,9 @@ impl Drop for FluidAudioBridge {
 #[derive(Debug, Clone)]
 pub struct AsrResult {
     pub text: String,
+    /// Mean per-token probability clamped to [0.1, 1.0], on the same scale as
+    /// FluidAudio's TDT confidence; 0.1 for an empty transcript. Always 0.0
+    /// from `transcribe_file_streaming`.
     pub confidence: f32,
     pub duration: f64,
     pub processing_time: f64,
