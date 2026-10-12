@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Apple Silicon: {}\n", audio.is_apple_silicon());
 
     // Initialize Streaming ASR
-    println!("Initializing Streaming ASR (downloads the streaming encoder on first run)...");
+    println!("Initializing Streaming ASR (downloads ~610 MB on first run)...");
     let start = Instant::now();
     audio.init_streaming_asr()?;
     println!(

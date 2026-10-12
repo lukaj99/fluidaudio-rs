@@ -88,8 +88,8 @@ Streaming ASR runs the streaming export of Parakeet Unified EN 0.6B: each step
 re-encodes 5.6 s of left context, a 1.04 s chunk and 1.04 s of look-ahead. A
 step runs once 2.08 s of audio is buffered and then every 1.04 s, so a word
 reaches the partial transcript about 2.08 s after it is spoken.
-`init_streaming_asr` downloads the streaming encoder (~592 MB) on first use;
-the rest of the model is shared with `init_asr`.
+`init_streaming_asr` downloads its own ~610 MB model set on first use, into a
+folder separate from `init_asr`'s (see [Model Loading](#model-loading)).
 
 #### Session-Based API
 
@@ -205,13 +205,19 @@ Models download from Hugging Face on first use into
 `~/Library/Application Support/FluidAudio/Models/`. Parakeet Unified EN 0.6B
 comes from [`FluidInference/parakeet-unified-en-0.6b-coreml`](https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml),
 pinned to commit `d32e972dd4315f1dc3f6be28fb2aab0ab3e80358` so new uploads
-cannot change what an existing build loads, into the `parakeet-unified-en-0.6b`
-folder:
+cannot change what an existing build loads. The pin applies to both calls:
 
-| Call | Downloads |
-|------|-----------|
-| `init_asr` | int8 offline encoder, decoder, joint, `vocab.json`, `metadata.json` (~614 MB) |
-| `init_streaming_asr` | int8 streaming encoder (~592 MB), plus the shared decoder, joint and vocab files if `init_asr` has not fetched them |
+| Call | Folder under `Models/` | Downloads |
+|------|------------------------|-----------|
+| `init_asr` | `parakeet-unified-en-0.6b` | int8 offline encoder, decoder, joint, `vocab.json`, `metadata.json` (~614 MB) |
+| `init_streaming_asr` | `parakeet-unified-preview/parakeet-unified-en-0.6b` | int8 streaming encoder, plus its own copies of the decoder, joint, `vocab.json` and `metadata.json` (~610 MB) |
+
+The two engines never share a folder. When a model fails to load for any
+reason other than a network error, FluidAudio deletes the whole folder and
+downloads it again, so in a shared folder a failed live-preview load would
+delete the one-shot encoder. Keeping them apart costs about 18 MB of duplicated
+decoder, joint and vocabulary files. Each folder's loads run one at a time;
+loads into different folders run in parallel.
 
 On an M5 Pro (macOS 27.2) the first load after the download compiles the
 models for the Neural Engine: about 8.5 s for `init_asr` and 6.5 s for

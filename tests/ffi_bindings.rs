@@ -367,7 +367,7 @@ fn asr_transcribe_file_is_stateless_across_calls() {
 /// new, non-empty partials; and a second session over the same audio yields
 /// the same final text, so no state carries over between sessions.
 #[test]
-#[ignore = "downloads the Parakeet Unified EN 0.6B streaming encoder (~592 MB) and triggers ANE compilation"]
+#[ignore = "downloads the Parakeet Unified EN 0.6B live-preview set (~610 MB) and triggers ANE compilation"]
 fn streaming_asr_sessions_share_one_engine() {
     let audio = std::sync::Arc::new(FluidAudio::new().expect("bridge creation"));
 
@@ -416,6 +416,297 @@ fn streaming_asr_sessions_share_one_engine() {
     assert_eq!(
         first, second,
         "the second session must not carry state from the first"
+    );
+}
+
+/// What Parakeet Unified EN 0.6B (int8, revision d32e972) returns for jfk.wav,
+/// one-shot and streaming alike. jfk.wav is the public-domain 11 s clip of
+/// President Kennedy's 1961 inaugural address that whisper.cpp ships.
+const JFK_TEXT: &str = "And so, my fellow Americans, ask not what your country can do for you. \
+                        Ask what you can do for your country.";
+
+fn jfk_samples() -> Vec<f32> {
+    read_wav_samples(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jfk.wav"),
+    )
+}
+
+/// One-shot transcription runs while the same bridge loads the live-preview
+/// engine and then runs streaming sessions: every one-shot call, and every
+/// streaming session, returns the solo transcript.
+#[test]
+#[ignore = "downloads both Parakeet Unified EN 0.6B sets (~1.2 GB) and triggers ANE compilation"]
+fn one_shot_runs_during_streaming_load_and_sessions() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let audio = Arc::new(FluidAudio::new().expect("bridge creation"));
+    audio.init_asr().expect("ASR init");
+    let samples = Arc::new(jfk_samples());
+    assert_eq!(
+        audio.transcribe_samples(&samples).expect("solo").text,
+        JFK_TEXT
+    );
+
+    let preview_loaded = Arc::new(AtomicBool::new(false));
+    let one_shot = {
+        let (audio, samples, preview_loaded) = (
+            Arc::clone(&audio),
+            Arc::clone(&samples),
+            Arc::clone(&preview_loaded),
+        );
+        std::thread::spawn(move || {
+            let (mut during_load, mut after_load) = (0, 0);
+            // Keep going for 20 calls after the preview has loaded, so the
+            // main thread's sessions overlap them.
+            while after_load < 20 {
+                let loaded = preview_loaded.load(Ordering::SeqCst);
+                let result = audio.transcribe_samples(&samples).expect("one-shot");
+                assert_eq!(result.text, JFK_TEXT);
+                if loaded {
+                    after_load += 1;
+                } else {
+                    during_load += 1;
+                }
+            }
+            during_load
+        })
+    };
+
+    audio.init_streaming_asr().expect("streaming ASR init");
+    preview_loaded.store(true, Ordering::SeqCst);
+
+    let mut sessions = 0;
+    while sessions == 0 || !one_shot.is_finished() {
+        audio.streaming_asr_start().expect("start");
+        for chunk in samples.chunks(1_600) {
+            audio.streaming_asr_feed(chunk).expect("feed");
+        }
+        assert_eq!(audio.streaming_asr_finish().expect("finish"), JFK_TEXT);
+        sessions += 1;
+    }
+    let during_load = one_shot.join().expect("one-shot thread panicked");
+    println!(
+        "one-shot calls: {during_load} during the preview load, 20 after; streaming sessions: {sessions}"
+    );
+}
+
+// ---- Scratch-home tests ---------------------------------------------------
+//
+// FluidAudio always resolves its model folders under Application Support, and
+// macOS resolves that from CFFIXED_USER_HOME when it is set at process start.
+// These tests therefore run their body in a child copy of this test binary
+// with CFFIXED_USER_HOME pointing at a scratch home. The parent clones the
+// real model folders into it (APFS clones: no extra disk, and the originals
+// are never written). Run without SCRATCH_CHILD, the child tests do nothing.
+
+const SCRATCH_CHILD: &str = "FLUIDAUDIO_RS_SCRATCH_CHILD";
+const UNIFIED: &str = "parakeet-unified-en-0.6b";
+const PREVIEW_PARENT: &str = "parakeet-unified-preview";
+const OFFLINE_ENCODER_WEIGHTS: &str = "parakeet_unified_encoder_int8.mlmodelc/weights/weight.bin";
+const STREAMING_ENCODER: &str = "parakeet_unified_encoder_streaming_70_13_13_int8.mlmodelc";
+
+fn models_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Library/Application Support/FluidAudio/Models")
+}
+
+/// A fresh scratch home holding APFS clones of the real one-shot and preview
+/// folders. Loads both engines in this process first, so the folders exist.
+fn scratch_home(name: &str, with_preview: bool) -> std::path::PathBuf {
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio.init_asr().expect("ASR init (real home)");
+    if with_preview {
+        audio
+            .init_streaming_asr()
+            .expect("streaming ASR init (real home)");
+    }
+
+    let real = models_dir(&std::path::PathBuf::from(std::env::var("HOME").unwrap()));
+    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&home);
+    let models = models_dir(&home);
+    std::fs::create_dir_all(models.join(PREVIEW_PARENT)).unwrap();
+    let mut pairs = vec![(real.join(UNIFIED), models.join(UNIFIED))];
+    if with_preview {
+        pairs.push((
+            real.join(PREVIEW_PARENT).join(UNIFIED),
+            models.join(PREVIEW_PARENT).join(UNIFIED),
+        ));
+    }
+    for (from, to) in pairs {
+        let status = std::process::Command::new("cp")
+            .arg("-cR")
+            .arg(&from)
+            .arg(&to)
+            .status()
+            .expect("run cp");
+        assert!(status.success(), "cloning {from:?} failed");
+    }
+    home
+}
+
+/// Runs the ignored test `child` in a child process with the scratch home.
+fn run_child(child: &str, home: &std::path::Path, env: &[(&str, String)]) {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            child,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("CFFIXED_USER_HOME", home)
+        .env(SCRATCH_CHILD, child)
+        .env_remove("REGISTRY_URL")
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+        .output()
+        .expect("spawn child test");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("--- {child} ---\n{log}");
+    assert!(output.status.success(), "{child} failed");
+    assert!(log.contains("1 passed"), "{child} did not run");
+}
+
+fn is_scratch_child(name: &str) -> bool {
+    std::env::var(SCRATCH_CHILD).as_deref() == Ok(name)
+}
+
+/// A failed live-preview load must not delete the one-shot model. FluidAudio
+/// purges the whole folder of a model that fails to load; the preview has its
+/// own folder, so only the preview files go.
+#[test]
+#[ignore = "downloads both Parakeet Unified EN 0.6B sets (~1.2 GB) and triggers ANE compilation"]
+fn failed_preview_load_keeps_the_one_shot_model() {
+    let home = scratch_home("preview-purge-home", true);
+    let models = models_dir(&home);
+    let offline_weights = models.join(UNIFIED).join(OFFLINE_ENCODER_WEIGHTS);
+    let offline_len = std::fs::metadata(&offline_weights).unwrap().len();
+
+    // Corrupt the clone's streaming encoder weights, so Core ML fails to build
+    // the execution plan, as on chips the int8 encoder does not support.
+    // Replacing the file (not writing into it) leaves the real home's copy
+    // untouched. (A garbage model.mil is no good: Core ML 27.2 crashes with
+    // EXC_BAD_ACCESS parsing it instead of throwing.)
+    let preview = models.join(PREVIEW_PARENT).join(UNIFIED);
+    let weights = preview.join(STREAMING_ENCODER).join("weights/weight.bin");
+    std::fs::remove_file(&weights).unwrap();
+    std::fs::write(&weights, b"not Core ML weights").unwrap();
+
+    // Port 9 (discard) refuses connections, so the re-download after the
+    // purge fails fast instead of fetching 610 MB.
+    run_child(
+        "scratch_child_failed_preview_load",
+        &home,
+        &[("MODEL_REGISTRY_URL", "http://127.0.0.1:9".to_string())],
+    );
+
+    assert_eq!(
+        std::fs::metadata(&offline_weights).map(|m| m.len()).ok(),
+        Some(offline_len),
+        "the one-shot encoder must survive a failed preview load"
+    );
+    assert!(
+        !preview.join(STREAMING_ENCODER).exists(),
+        "FluidAudio should have purged the corrupt preview folder"
+    );
+}
+
+#[test]
+#[ignore = "child of failed_preview_load_keeps_the_one_shot_model"]
+fn scratch_child_failed_preview_load() {
+    if !is_scratch_child("scratch_child_failed_preview_load") {
+        return;
+    }
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio.init_asr().expect("ASR init from the scratch home");
+    assert!(
+        audio.init_streaming_asr().is_err(),
+        "the corrupt preview encoder must fail to load"
+    );
+    assert!(!audio.is_streaming_asr_available());
+    assert_eq!(
+        audio
+            .transcribe_samples(&jfk_samples())
+            .expect("one-shot")
+            .text,
+        JFK_TEXT
+    );
+}
+
+/// `init_asr` must not wait for a preview download in progress. The child's
+/// registry accepts connections and never answers, so the preview load hangs
+/// in its download until the child closes them.
+#[test]
+#[ignore = "downloads Parakeet Unified EN 0.6B (~614 MB) and triggers ANE compilation"]
+fn one_shot_load_does_not_wait_for_a_preview_download() {
+    let home = scratch_home("preview-hang-home", false);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    run_child(
+        "scratch_child_one_shot_during_preview_download",
+        &home,
+        &[
+            ("MODEL_REGISTRY_URL", format!("http://127.0.0.1:{port}")),
+            ("SCRATCH_REGISTRY_PORT", port.to_string()),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "child of one_shot_load_does_not_wait_for_a_preview_download"]
+fn scratch_child_one_shot_during_preview_download() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    if !is_scratch_child("scratch_child_one_shot_during_preview_download") {
+        return;
+    }
+    let port = std::env::var("SCRATCH_REGISTRY_PORT").unwrap();
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).expect("bind registry");
+
+    let audio = Arc::new(FluidAudio::new().expect("bridge creation"));
+    let preview = {
+        let audio = Arc::clone(&audio);
+        std::thread::spawn(move || audio.init_streaming_asr())
+    };
+
+    // The preview load is now inside its lock, waiting on the registry.
+    let (held, _) = listener.accept().expect("preview download connects");
+
+    let start = Instant::now();
+    audio.init_asr().expect("ASR init from the scratch home");
+    let result = audio.transcribe_samples(&jfk_samples()).expect("one-shot");
+    assert_eq!(result.text, JFK_TEXT);
+    assert!(
+        !preview.is_finished(),
+        "the preview load should still be stuck in its download"
+    );
+    println!(
+        "init_asr and one transcription took {:?} during the preview download",
+        start.elapsed()
+    );
+
+    // Release the preview load: closed connections and a closed port.
+    drop(held);
+    drop(listener);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !preview.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "the preview load did not give up"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        preview.join().unwrap().is_err(),
+        "the preview load cannot succeed offline"
     );
 }
 

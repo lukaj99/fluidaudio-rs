@@ -33,13 +33,32 @@ class FluidAudioBridgeInternal {
     private let streamingAsrLock = NSLock()
     private var streamingAsrManager: StreamingUnifiedAsrManager?
     private var lastStreamingPartial = ""
-    // Every Parakeet load, from any bridge in the process, downloads into the
-    // same `parakeet-unified-en-0.6b` folder; concurrent first-time downloads
-    // would write the same `.partial` files, so loads run one at a time.
-    private static let asrLoadLock = NSLock()
+    // The one-shot and preview engines download into separate folders (see
+    // `previewModelsDirectory`). Loads into the same folder, from any bridge in
+    // the process, would write the same `.partial` files, so each folder has
+    // its own process-wide lock: one-shot loads queue behind one-shot loads,
+    // preview loads behind preview loads, and neither waits for the other.
+    private static let oneShotLoadLock = NSLock()
+    private static let previewLoadLock = NSLock()
+
+    /// Base directory for the live-preview (streaming) engine:
+    /// `~/Library/Application Support/FluidAudio/Models/parakeet-unified-preview`,
+    /// so its files land in `parakeet-unified-preview/parakeet-unified-en-0.6b`
+    /// (~610 MB: the int8 streaming encoder plus its own copies of the decoder,
+    /// joint, vocab and metadata).
+    ///
+    /// It is kept apart from the one-shot folder because FluidAudio's
+    /// `ModelHub.loadWithRecovery` deletes the whole repo folder after a load
+    /// failure that is not a network error or a cancellation. In a shared
+    /// folder a failed preview load would delete the one-shot encoder, and a
+    /// failed one-shot load the streaming encoder.
+    private static let previewModelsDirectory = MLModelConfigurationUtils
+        .defaultModelsDirectory()
+        .appendingPathComponent("parakeet-unified-preview", isDirectory: true)
 
     /// Hugging Face commit of the Core ML Parakeet Unified weights both ASR
-    /// paths download. Unpinned, FluidAudio follows the repo's `main` branch.
+    /// paths download. FluidAudio applies it by repo, whatever the target
+    /// folder. Unpinned, FluidAudio follows the repo's `main` branch.
     private static let unifiedWeightsRepo = "FluidInference/parakeet-unified-en-0.6b-coreml"
     private static let unifiedWeightsRevision = "d32e972dd4315f1dc3f6be28fb2aab0ab3e80358"
 
@@ -60,8 +79,8 @@ class FluidAudioBridgeInternal {
     /// encoder, decoder, joint, vocab, metadata) into
     /// `Application Support/FluidAudio/Models/parakeet-unified-en-0.6b`.
     func initializeAsr() throws {
-        Self.asrLoadLock.lock()
-        defer { Self.asrLoadLock.unlock() }
+        Self.oneShotLoadLock.lock()
+        defer { Self.oneShotLoadLock.unlock() }
 
         let manager = UnifiedAsrManager(encoderPrecision: .int8)
         let semaphore = DispatchSemaphore(value: 0)
@@ -508,15 +527,18 @@ class FluidAudioBridgeInternal {
     ///
     /// One `StreamingUnifiedAsrManager` at FluidAudio's default [70, 13, 13]
     /// encoder context (5.6 s left, 1.04 s chunk, 1.04 s right: 2.08 s latency)
-    /// serves every session. Its streaming encoder is a separate ~592 MB
-    /// download; the decoder, joint and vocab are shared with the one-shot set.
+    /// serves every session. The first call downloads ~610 MB (the streaming
+    /// encoder plus its own decoder, joint, vocab and metadata) into
+    /// `previewModelsDirectory`, apart from the one-shot set, so a failed load
+    /// here never deletes the one-shot model.
     ///
     /// Blocks until the model is downloaded and loaded. Other threads may poll
     /// `isStreamingAsrAvailable()` meanwhile; it turns true only once the
-    /// manager has loaded. Calling this again after a successful load is a no-op.
+    /// manager has loaded. One-shot loads and transcriptions do not wait for
+    /// it. Calling this again after a successful load is a no-op.
     func initializeStreamingAsr() throws {
-        Self.asrLoadLock.lock()
-        defer { Self.asrLoadLock.unlock() }
+        Self.previewLoadLock.lock()
+        defer { Self.previewLoadLock.unlock() }
         if isStreamingAsrAvailable() {
             return
         }
@@ -527,7 +549,7 @@ class FluidAudioBridgeInternal {
 
         Task {
             do {
-                try await manager.loadModels()
+                try await manager.loadModels(to: Self.previewModelsDirectory)
             } catch {
                 initError = error
             }

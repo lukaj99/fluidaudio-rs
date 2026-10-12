@@ -158,12 +158,19 @@ impl FluidAudio {
     /// Initialize Streaming ASR for live partial transcripts
     ///
     /// Loads the streaming Parakeet Unified EN 0.6B engine (2.08 s latency). The
-    /// first run downloads its streaming encoder (~592 MB) into the same folder
-    /// as [`init_asr`](Self::init_asr), whose decoder, joint and vocabulary it
-    /// shares. Blocks until loaded, so it can run on a background thread while
-    /// other threads transcribe one-shot or poll
-    /// [`is_streaming_asr_available`](Self::is_streaming_asr_available). Model
-    /// loads run one at a time, and a call after a successful load returns at once.
+    /// first run downloads ~610 MB (the int8 streaming encoder plus its own
+    /// decoder, joint, vocabulary and metadata) into
+    /// `~/Library/Application Support/FluidAudio/Models/parakeet-unified-preview/parakeet-unified-en-0.6b`,
+    /// pinned to the same Hugging Face revision as [`init_asr`](Self::init_asr).
+    /// The folder is separate from `init_asr`'s because FluidAudio deletes a
+    /// model folder after a non-network load failure: a failed preview load
+    /// cannot remove the one-shot model, nor the reverse.
+    ///
+    /// Blocks until loaded, so it can run on a background thread while other
+    /// threads call `init_asr`, transcribe one-shot or poll
+    /// [`is_streaming_asr_available`](Self::is_streaming_asr_available); none of
+    /// those wait for it. Concurrent `init_streaming_asr` calls run one at a
+    /// time, and a call after a successful load returns at once.
     ///
     /// # Example
     /// ```rust,no_run
