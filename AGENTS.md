@@ -59,7 +59,7 @@ When adding new FluidAudio features to the Rust bindings:
 - macOS 14+ or iOS 17+
 - Apple Silicon recommended (Intel has limited support)
 - Rust 1.70+
-- Swift 5.10+
+- Swift 6.2+ toolchain (Xcode 26+)
 
 ## Known Issues
 

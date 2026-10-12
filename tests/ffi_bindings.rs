@@ -21,8 +21,7 @@ fn bridge_create_and_drop_is_safe() {
     drop(audio);
 }
 
-/// Multiple bridges can coexist. The Swift side maintains a `globalBridge`
-/// pointer for compatibility but each Rust handle owns its own retained
+/// Multiple bridges can coexist. Each Rust handle owns its own retained
 /// instance, so creating a second bridge must not invalidate the first.
 #[test]
 fn multiple_bridges_can_be_created() {
@@ -35,6 +34,25 @@ fn multiple_bridges_can_be_created() {
     let info_b = b.system_info();
     assert_eq!(info_a.platform, info_b.platform);
     assert_eq!(info_a.is_apple_silicon, info_b.is_apple_silicon);
+}
+
+/// Bridges created and dropped on several threads at once must not interfere.
+/// The Swift side once assigned every new bridge to an unsynchronized global,
+/// and concurrent assignments over-released bridges (SIGSEGV in deinit).
+#[test]
+fn bridges_can_be_created_and_dropped_concurrently() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                for _ in 0..200 {
+                    drop(FluidAudio::new().expect("bridge creation"));
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("bridge thread panicked");
+    }
 }
 
 /// `cleanup` must be idempotent. The destructor calls it again on drop, so
@@ -61,14 +79,6 @@ fn availability_is_false_before_init() {
     assert!(
         !audio.is_diarization_available(),
         "diarization should be unavailable pre-init"
-    );
-    assert!(
-        !audio.is_qwen3_asr_available(),
-        "Qwen3 ASR should be unavailable pre-init"
-    );
-    assert!(
-        !audio.is_qwen3_streaming_available(),
-        "Qwen3 streaming should be unavailable pre-init"
     );
 }
 
@@ -130,11 +140,6 @@ fn missing_file_returns_file_not_found() {
         .diarize_file("/this/path/definitely/does/not/exist.wav")
         .expect_err("diarize_file with missing path must error");
     assert!(matches!(err, FluidAudioError::FileNotFound(_)));
-
-    let err = audio
-        .qwen3_transcribe_file("/this/path/definitely/does/not/exist.wav", None)
-        .expect_err("qwen3_transcribe_file with missing path must error");
-    assert!(matches!(err, FluidAudioError::FileNotFound(_)));
 }
 
 /// Calling streaming ASR session methods before initializing must surface a
@@ -160,17 +165,6 @@ fn nemotron_streaming_session_methods_error_before_init() {
     assert!(audio.nemotron_streaming_get_partial().is_err());
     assert!(audio.nemotron_streaming_finish().is_err());
     assert!(audio.nemotron_streaming_reset().is_err());
-}
-
-/// Same as above for the Qwen3 streaming session methods. On macOS 14 these
-/// will fail because Qwen3 requires macOS 15; on macOS 15+ they fail because
-/// the manager isn't initialized. Either way, no crash, just an error.
-#[test]
-fn qwen3_streaming_session_methods_error_before_init() {
-    let audio = FluidAudio::new().expect("bridge creation");
-    assert!(audio.qwen3_streaming_start(None, 1.0, 2.0, 30.0).is_err());
-    assert!(audio.qwen3_streaming_feed(&[0.0_f32; 1600]).is_err());
-    assert!(audio.qwen3_streaming_finish().is_err());
 }
 
 /// VAD `process` methods must error before `init_vad` rather than crash.
@@ -269,7 +263,7 @@ fn vad_processes_silence_buffer() {
 /// transcript content, only that the call returns successfully and the
 /// reported duration matches the input length.
 #[test]
-#[ignore = "downloads Parakeet TDT models (~600MB) and triggers ANE compilation"]
+#[ignore = "downloads Parakeet TDT v2 models (~465 MB) and triggers ANE compilation"]
 fn asr_transcribes_silence_buffer() {
     let audio = FluidAudio::new().expect("bridge creation");
     audio.init_asr().expect("ASR init");
@@ -306,7 +300,7 @@ fn asr_transcribes_silence_buffer() {
 /// Apple's TTS output isn't subject to third-party licensing; regenerating
 /// it on any macOS host produces a comparable clip.
 #[test]
-#[ignore = "downloads Parakeet TDT models (~600MB) and triggers ANE compilation"]
+#[ignore = "downloads Parakeet TDT v2 models (~465 MB) and triggers ANE compilation"]
 fn asr_transcribe_file_is_stateless_across_calls() {
     let audio = FluidAudio::new().expect("bridge creation");
     audio.init_asr().expect("ASR init");
