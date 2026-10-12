@@ -11,7 +11,7 @@
 //! with `#[ignore]` and can be run via:
 //!     cargo test --test ffi_bindings -- --ignored
 
-use fluidaudio_rs::{FluidAudio, FluidAudioError};
+use fluidaudio_rs::{EncoderPrecision, FluidAudio, FluidAudioError};
 
 /// The bridge can be created and dropped without panicking. Drop must not
 /// crash even if no `init_*` method was ever called.
@@ -80,6 +80,14 @@ fn availability_is_false_before_init() {
         !audio.is_diarization_available(),
         "diarization should be unavailable pre-init"
     );
+}
+
+/// Neither ASR path reports an encoder precision before it has loaded.
+#[test]
+fn encoder_precision_is_unknown_before_init() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    assert_eq!(audio.asr_encoder_precision(), None);
+    assert_eq!(audio.streaming_asr_encoder_precision(), None);
 }
 
 /// `system_info()` exercises Swift→Rust string ownership: the Swift side
@@ -508,6 +516,20 @@ fn jfk_samples() -> Vec<f32> {
     )
 }
 
+/// Where Core ML can run it, both ASR paths load the int8 encoder.
+#[test]
+#[ignore = "downloads both Parakeet Unified EN 0.6B sets (~1.2 GB) and triggers ANE compilation"]
+fn both_asr_paths_load_the_int8_encoder() {
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio.init_asr().expect("ASR init");
+    audio.init_streaming_asr().expect("streaming ASR init");
+    assert_eq!(audio.asr_encoder_precision(), Some(EncoderPrecision::Int8));
+    assert_eq!(
+        audio.streaming_asr_encoder_precision(),
+        Some(EncoderPrecision::Int8)
+    );
+}
+
 /// A short clip whose mel frame count, floor(n / 160), is 0 mod 8 must not
 /// decode to "". The first 15,360 samples (0.96 s, 96 frames) of jfk.wav came
 /// back "" before the bridge padded one-shot input to 8k + 1 frames (ALIGN).
@@ -664,6 +686,7 @@ const PREVIEW_PARENT: &str = "parakeet-unified-preview";
 const OFFLINE_ENCODER_WEIGHTS: &str = "parakeet_unified_encoder_int8.mlmodelc/weights/weight.bin";
 const NEMOTRON_1120: &str = "nemotron-streaming/1120ms";
 const STREAMING_ENCODER: &str = "parakeet_unified_encoder_streaming_70_13_13_int8.mlmodelc";
+const ONE_SHOT_FP16_PARENT: &str = "parakeet-unified-fp16";
 
 fn models_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join("Library/Application Support/FluidAudio/Models")
@@ -793,6 +816,109 @@ fn scratch_child_failed_preview_load() {
             .expect("one-shot")
             .text,
         JFK_TEXT
+    );
+}
+
+/// `chmod -R <mode> path`, if it exists.
+fn chmod_tree(path: &std::path::Path, mode: &str) {
+    if path.exists() {
+        let status = std::process::Command::new("chmod")
+            .args(["-R", mode])
+            .arg(path)
+            .status()
+            .expect("run chmod");
+        assert!(status.success(), "chmod {mode} {path:?} failed");
+    }
+}
+
+/// When Core ML cannot load the int8 one-shot encoder, `init_asr` loads the
+/// fp16 one from its own folder, transcribes with it, and leaves the preview
+/// folder alone.
+#[test]
+#[ignore = "downloads the fp16 one-shot set (~1.2 GB) on its first run and triggers ANE compilation"]
+fn one_shot_falls_back_to_fp16_when_int8_will_not_load() {
+    let tmp = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    // A failed earlier run can leave a read-only folder that blocks cleanup.
+    chmod_tree(&tmp.join("fp16-fallback-home"), "u+w");
+    let home = scratch_home("fp16-fallback-home", true);
+    let models = models_dir(&home);
+
+    // Corrupt the clone's int8 weights (replacing the file, so the real
+    // home's copy is untouched). FluidAudio purges and re-downloads a folder
+    // whose model fails to load, which would repair them; a read-only clone
+    // cannot be purged, so the int8 encoder keeps failing in Core ML, as on a
+    // chip that cannot run it at all.
+    let int8 = models.join(UNIFIED);
+    let weights = int8.join(OFFLINE_ENCODER_WEIGHTS);
+    std::fs::remove_file(&weights).unwrap();
+    std::fs::write(&weights, b"not Core ML weights").unwrap();
+    chmod_tree(&int8, "a-w");
+
+    // An earlier run's fp16 set, kept beside the scratch home, saves the
+    // ~1.2 GB download.
+    let seed = tmp.join("fp16-one-shot-seed");
+    let fp16 = models.join(ONE_SHOT_FP16_PARENT);
+    if seed.exists() {
+        let status = std::process::Command::new("cp")
+            .arg("-cR")
+            .arg(&seed)
+            .arg(&fp16)
+            .status()
+            .expect("run cp");
+        assert!(status.success(), "cloning the fp16 seed failed");
+    }
+    let preview_weights = models
+        .join(PREVIEW_PARENT)
+        .join(UNIFIED)
+        .join(STREAMING_ENCODER)
+        .join("weights/weight.bin");
+    let preview_len = std::fs::metadata(&preview_weights).unwrap().len();
+
+    run_child("scratch_child_fp16_fallback", &home, &[]);
+    chmod_tree(&int8, "u+w");
+
+    assert_eq!(
+        std::fs::metadata(&preview_weights).map(|m| m.len()).ok(),
+        Some(preview_len),
+        "the one-shot fallback must not touch the preview folder"
+    );
+    let size = std::process::Command::new("du")
+        .arg("-sh")
+        .arg(&fp16)
+        .output()
+        .expect("run du");
+    println!("fp16 set: {}", String::from_utf8_lossy(&size.stdout).trim());
+    if !seed.exists() {
+        let status = std::process::Command::new("cp")
+            .arg("-cR")
+            .arg(&fp16)
+            .arg(&seed)
+            .status()
+            .expect("run cp");
+        assert!(status.success(), "saving the fp16 seed failed");
+    }
+}
+
+#[test]
+#[ignore = "child of one_shot_falls_back_to_fp16_when_int8_will_not_load"]
+fn scratch_child_fp16_fallback() {
+    if !is_scratch_child("scratch_child_fp16_fallback") {
+        return;
+    }
+    let audio = FluidAudio::new().expect("bridge creation");
+    audio
+        .init_asr()
+        .expect("init_asr should fall back to the fp16 encoder");
+    assert_eq!(audio.asr_encoder_precision(), Some(EncoderPrecision::Fp16));
+    let text = audio
+        .transcribe_samples(&jfk_samples())
+        .expect("fp16 one-shot")
+        .text;
+    println!("fp16 transcript: {text:?}");
+    assert!(
+        text.to_lowercase()
+            .contains("ask not what your country can do for you"),
+        "unexpected transcript {text:?}"
     );
 }
 

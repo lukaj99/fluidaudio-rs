@@ -39,7 +39,7 @@ use std::path::Path;
 use thiserror::Error;
 
 // Re-export FFI types
-pub use ffi::{AsrResult, DiarizationSegment, SystemInfo, VadFrame};
+pub use ffi::{AsrResult, DiarizationSegment, EncoderPrecision, SystemInfo, VadFrame};
 
 /// Errors that can occur when using FluidAudio
 #[derive(Error, Debug)]
@@ -90,6 +90,12 @@ impl FluidAudio {
     /// (~614 MB) into `~/Library/Application Support/FluidAudio/Models/parakeet-unified-en-0.6b`,
     /// pinned to a fixed Hugging Face revision, and compiles it for the Neural
     /// Engine; later runs load from that cache. Blocks until loaded.
+    ///
+    /// If Core ML cannot load the int8 encoder even after FluidAudio's own
+    /// purge and re-download (some chips cannot run it), this loads the fp16
+    /// set instead (~1.2 GB, in `Models/parakeet-unified-fp16/parakeet-unified-en-0.6b`)
+    /// and logs the switch; see [`asr_encoder_precision`](Self::asr_encoder_precision).
+    /// Network errors do not trigger the fallback.
     pub fn init_asr(&self) -> Result<(), FluidAudioError> {
         self.bridge.initialize_asr().map_err(FluidAudioError::from)
     }
@@ -153,6 +159,12 @@ impl FluidAudio {
         self.bridge.is_asr_available()
     }
 
+    /// Encoder precision the one-shot engine loaded with: `Int8` normally,
+    /// `Fp16` after a fallback, `None` before [`init_asr`](Self::init_asr).
+    pub fn asr_encoder_precision(&self) -> Option<EncoderPrecision> {
+        self.bridge.asr_encoder_precision()
+    }
+
     // ========== Vocabulary Boosting ==========
 
     /// Boost recognition of `terms` (names, jargon, drug names) in one-shot
@@ -194,7 +206,9 @@ impl FluidAudio {
     /// pinned to the same Hugging Face revision as [`init_asr`](Self::init_asr).
     /// The folder is separate from `init_asr`'s because FluidAudio deletes a
     /// model folder after a non-network load failure: a failed preview load
-    /// cannot remove the one-shot model, nor the reverse.
+    /// cannot remove the one-shot model, nor the reverse. Like `init_asr`, it
+    /// falls back to the fp16 encoder when Core ML cannot load the int8 one,
+    /// from `Models/parakeet-unified-preview-fp16/parakeet-unified-en-0.6b`.
     ///
     /// Blocks until loaded, so it can run on a background thread while other
     /// threads call `init_asr`, transcribe one-shot or poll
@@ -330,6 +344,12 @@ impl FluidAudio {
     /// [`init_streaming_asr`](Self::init_streaming_asr) is still loading.
     pub fn is_streaming_asr_available(&self) -> bool {
         self.bridge.is_streaming_asr_available()
+    }
+
+    /// Encoder precision the live-preview engine loaded with, `None` before
+    /// [`init_streaming_asr`](Self::init_streaming_asr) succeeds.
+    pub fn streaming_asr_encoder_precision(&self) -> Option<EncoderPrecision> {
+        self.bridge.streaming_asr_encoder_precision()
     }
 
     // ========== Nemotron Streaming ASR Methods ==========

@@ -22,6 +22,9 @@ extern "C" {
     ) -> i32;
     fn fluidaudio_is_asr_available(bridge: *mut std::ffi::c_void) -> i32;
 
+    fn fluidaudio_asr_encoder_precision(bridge: *mut std::ffi::c_void) -> i32;
+    fn fluidaudio_streaming_asr_encoder_precision(bridge: *mut std::ffi::c_void) -> i32;
+
     // Vocabulary boosting (one-shot ASR)
     fn fluidaudio_set_vocabulary(
         bridge: *mut std::ffi::c_void,
@@ -429,6 +432,14 @@ impl FluidAudioBridge {
 
     pub fn is_asr_available(&self) -> bool {
         unsafe { fluidaudio_is_asr_available(self.ptr) != 0 }
+    }
+
+    pub fn asr_encoder_precision(&self) -> Option<EncoderPrecision> {
+        EncoderPrecision::from_code(unsafe { fluidaudio_asr_encoder_precision(self.ptr) })
+    }
+
+    pub fn streaming_asr_encoder_precision(&self) -> Option<EncoderPrecision> {
+        EncoderPrecision::from_code(unsafe { fluidaudio_streaming_asr_encoder_precision(self.ptr) })
     }
 
     pub fn set_vocabulary(&self, terms: &[String]) -> Result<(), String> {
@@ -978,6 +989,33 @@ pub struct AsrResult {
     pub duration: f64,
     pub processing_time: f64,
     pub rtfx: f32,
+}
+
+/// Weight precision of a loaded Parakeet Unified encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderPrecision {
+    /// The default int8 encoder (~614 MB set).
+    Int8,
+    /// The fp16 encoder, loaded when Core ML cannot load the int8 one.
+    Fp16,
+}
+
+impl EncoderPrecision {
+    /// `"int8"` or `"fp16"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EncoderPrecision::Int8 => "int8",
+            EncoderPrecision::Fp16 => "fp16",
+        }
+    }
+
+    fn from_code(code: i32) -> Option<Self> {
+        match code {
+            1 => Some(EncoderPrecision::Int8),
+            2 => Some(EncoderPrecision::Fp16),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

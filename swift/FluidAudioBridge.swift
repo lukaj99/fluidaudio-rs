@@ -19,6 +19,8 @@ struct BridgeDiarizationSegment {
 
 class FluidAudioBridgeInternal {
     private var asrManager: UnifiedAsrManager?
+    // Recorded at load: the actor's own `encoderPrecision` needs an await.
+    private var asrPrecision: UnifiedEncoderPrecision?
     private var vadManager: VadManager?
     private var diarizerManager: OfflineDiarizerManager?
     private var nemotronStreamingManager: StreamingNemotronAsrManager?
@@ -33,6 +35,7 @@ class FluidAudioBridgeInternal {
     // only once it has loaded. The last partial handed out shares the lock.
     private let streamingAsrLock = NSLock()
     private var streamingAsrManager: StreamingUnifiedAsrManager?
+    private var streamingAsrPrecision: UnifiedEncoderPrecision?
     private var lastStreamingPartial = ""
     // The one-shot and preview engines download into separate folders (see
     // `previewModelsDirectory`). Loads into the same folder, from any bridge in
@@ -68,6 +71,22 @@ class FluidAudioBridgeInternal {
         .defaultModelsDirectory()
         .appendingPathComponent("parakeet-unified-preview", isDirectory: true)
 
+    /// Base directories for the fp16 encoder sets the two ASR paths fall back
+    /// to when Core ML cannot load their int8 encoder, so the files land in
+    /// `parakeet-unified-fp16/parakeet-unified-en-0.6b` (one-shot) and
+    /// `parakeet-unified-preview-fp16/parakeet-unified-en-0.6b` (preview).
+    ///
+    /// FluidAudio's default would put each fp16 encoder into its path's int8
+    /// folder. Separate folders keep `loadWithRecovery`'s purge contained: a
+    /// failed fp16 load cannot delete an int8 set, and the int8 attempt on
+    /// the next launch cannot delete the fp16 set it will fall back to.
+    private static let oneShotFp16ModelsDirectory = MLModelConfigurationUtils
+        .defaultModelsDirectory()
+        .appendingPathComponent("parakeet-unified-fp16", isDirectory: true)
+    private static let previewFp16ModelsDirectory = MLModelConfigurationUtils
+        .defaultModelsDirectory()
+        .appendingPathComponent("parakeet-unified-preview-fp16", isDirectory: true)
+
     /// Hugging Face commit of the Core ML Parakeet Unified weights both ASR
     /// paths download. FluidAudio applies it by repo, whatever the target
     /// folder. Unpinned, FluidAudio follows the repo's `main` branch.
@@ -96,29 +115,63 @@ class FluidAudioBridgeInternal {
     /// The first call downloads the offline file set (~614 MB: int8 15 s
     /// encoder, decoder, joint, vocab, metadata) into
     /// `Application Support/FluidAudio/Models/parakeet-unified-en-0.6b`.
+    /// If Core ML cannot load the int8 encoder, the fp16 set is loaded
+    /// instead, from `oneShotFp16ModelsDirectory`.
     func initializeAsr() throws {
         Self.oneShotLoadLock.lock()
         defer { Self.oneShotLoadLock.unlock() }
 
-        let manager = UnifiedAsrManager(encoderPrecision: .int8)
-        let semaphore = DispatchSemaphore(value: 0)
-        var initError: Error?
-
-        Task {
-            do {
-                try await manager.loadModels()
-            } catch {
-                initError = error
-            }
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-
-        if let error = initError {
-            throw error
+        let (manager, precision) = try Self.loadPreferringInt8(
+            path: "one-shot", int8Directory: nil, fp16Directory: Self.oneShotFp16ModelsDirectory
+        ) { precision, directory in
+            let manager = UnifiedAsrManager(encoderPrecision: precision)
+            try await manager.loadModels(to: directory)
+            return manager
         }
         asrManager = manager
+        asrPrecision = precision
+    }
+
+    /// Load a Parakeet Unified engine with the int8 encoder, or with the fp16
+    /// one if Core ML rejects int8.
+    ///
+    /// The int8 encoder cannot build an execution plan on some chips, even
+    /// from an intact download (FluidAudio issue #828). `load` runs through
+    /// FluidAudio's `loadWithRecovery`, which already purges and re-downloads
+    /// the folder once after a load failure, so a Core ML error that still
+    /// comes out of it is not a damaged download; one fp16 attempt follows.
+    /// Network errors and cancellations are rethrown: fp16 would not fare
+    /// better.
+    private static func loadPreferringInt8<Manager>(
+        path: String,
+        int8Directory: URL?,
+        fp16Directory: URL,
+        load: @escaping (UnifiedEncoderPrecision, URL?) async throws -> Manager
+    ) throws -> (Manager, UnifiedEncoderPrecision) {
+        do {
+            return (try blocking { try await load(.int8, int8Directory) }, .int8)
+        } catch let error where isCoreMLError(error) {
+            print(
+                "FluidAudioBridge: the \(path) int8 encoder failed to load (\(error)); retrying with the fp16 encoder in \(fp16Directory.path)"
+            )
+            return (try blocking { try await load(.fp16, fp16Directory) }, .fp16)
+        }
+    }
+
+    /// Whether `error`, or an error it wraps, comes from Core ML.
+    static func isCoreMLError(_ error: Error) -> Bool {
+        var next: NSError? = error as NSError
+        // Bounded: an underlying-error chain may loop.
+        for _ in 0..<8 {
+            guard let current = next else { return false }
+            if current.domain == MLModelErrorDomain { return true }
+            next = current.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return false
+    }
+
+    func asrEncoderPrecision() -> UnifiedEncoderPrecision? {
+        return asrManager == nil ? nil : asrPrecision
     }
 
     func transcribeFile(_ path: String) throws -> (String, Float, Double, Double, Float) {
@@ -671,27 +724,18 @@ class FluidAudioBridgeInternal {
             return
         }
 
-        let manager = StreamingUnifiedAsrManager(encoderPrecision: .int8)
-        let semaphore = DispatchSemaphore(value: 0)
-        var initError: Error?
-
-        Task {
-            do {
-                try await manager.loadModels(to: Self.previewModelsDirectory)
-            } catch {
-                initError = error
-            }
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-
-        if let error = initError {
-            throw error
+        let (manager, precision) = try Self.loadPreferringInt8(
+            path: "preview", int8Directory: Self.previewModelsDirectory,
+            fp16Directory: Self.previewFp16ModelsDirectory
+        ) { precision, directory in
+            let manager = StreamingUnifiedAsrManager(encoderPrecision: precision)
+            try await manager.loadModels(to: directory)
+            return manager
         }
 
         streamingAsrLock.lock()
         streamingAsrManager = manager
+        streamingAsrPrecision = precision
         streamingAsrLock.unlock()
     }
 
@@ -842,6 +886,12 @@ class FluidAudioBridgeInternal {
 
     func isStreamingAsrAvailable() -> Bool {
         return loadedStreamingAsrManager() != nil
+    }
+
+    func streamingAsrEncoderPrecision() -> UnifiedEncoderPrecision? {
+        streamingAsrLock.lock()
+        defer { streamingAsrLock.unlock() }
+        return streamingAsrManager == nil ? nil : streamingAsrPrecision
     }
 
     private func loadedStreamingAsrManager() -> StreamingUnifiedAsrManager? {
@@ -1270,6 +1320,31 @@ public func fluidaudio_is_asr_available(_ ptr: UnsafeMutableRawPointer?) -> Int3
     guard let ptr = ptr else { return 0 }
     let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
     return bridge.isAsrAvailable() ? 1 : 0
+}
+
+/// 0 when no engine is loaded, 1 for an int8 encoder, 2 for fp16.
+private func precisionCode(_ precision: UnifiedEncoderPrecision?) -> Int32 {
+    switch precision {
+    case nil: return 0
+    case .int8: return 1
+    case .fp16: return 2
+    }
+}
+
+/// Encoder precision of the loaded one-shot engine: 0 none, 1 int8, 2 fp16.
+@_cdecl("fluidaudio_asr_encoder_precision")
+public func fluidaudio_asr_encoder_precision(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return 0 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    return precisionCode(bridge.asrEncoderPrecision())
+}
+
+/// Encoder precision of the loaded live-preview engine: 0 none, 1 int8, 2 fp16.
+@_cdecl("fluidaudio_streaming_asr_encoder_precision")
+public func fluidaudio_streaming_asr_encoder_precision(_ ptr: UnsafeMutableRawPointer?) -> Int32 {
+    guard let ptr = ptr else { return 0 }
+    let bridge = Unmanaged<FluidAudioBridgeInternal>.fromOpaque(ptr).takeUnretainedValue()
+    return precisionCode(bridge.streamingAsrEncoderPrecision())
 }
 
 /// Hand `error`'s description to the caller through `outError` (free it with

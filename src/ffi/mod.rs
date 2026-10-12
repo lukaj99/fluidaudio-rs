@@ -1,3 +1,5 @@
 pub mod bridge;
 
-pub use bridge::{AsrResult, DiarizationSegment, FluidAudioBridge, SystemInfo, VadFrame};
+pub use bridge::{
+    AsrResult, DiarizationSegment, EncoderPrecision, FluidAudioBridge, SystemInfo, VadFrame,
+};
